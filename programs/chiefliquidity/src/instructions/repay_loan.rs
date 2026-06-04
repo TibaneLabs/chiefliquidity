@@ -24,6 +24,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LoanRepaid},
     math::{LoanSides, TriggerDirection},
     state::{
         bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
@@ -350,6 +351,14 @@ pub fn process_repay_loan(
         total_owed_u64,
         band_now_empty
     );
+    LoanRepaid {
+        pool: *pool_info.key,
+        loan: *loan_info.key,
+        borrower: *borrower_info.key,
+        debt_principal: loan.debt_principal,
+        total_owed: total_owed_u64,
+    }
+    .emit();
     Ok(())
 }
 

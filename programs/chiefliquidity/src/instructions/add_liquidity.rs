@@ -17,6 +17,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LiquidityAdded},
     math::{isqrt_u128, mul_div},
     state::{is_valid_token_program, Pool, POOL_SEED},
 };
@@ -225,6 +226,14 @@ pub fn process_add_liquidity(
         amount_b_in_u64,
         lp_to_mint_u64
     );
+    LiquidityAdded {
+        pool: *pool_info.key,
+        user: *user_info.key,
+        amount_a_in: amount_a_in_u64,
+        amount_b_in: amount_b_in_u64,
+        lp_minted: lp_to_mint_u64,
+    }
+    .emit();
     Ok(())
 }
 

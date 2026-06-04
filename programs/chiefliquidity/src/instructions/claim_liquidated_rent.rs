@@ -14,6 +14,7 @@ use solana_program::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LiquidatedRentClaimed},
     state::{Loan, LoanLink},
 };
 
@@ -72,6 +73,12 @@ pub fn process_claim_liquidated_rent(
         loan_info.key,
         borrower_info.key
     );
+    LiquidatedRentClaimed {
+        pool: loan.pool,
+        loan: *loan_info.key,
+        borrower: *borrower_info.key,
+    }
+    .emit();
     Ok(())
 }
 

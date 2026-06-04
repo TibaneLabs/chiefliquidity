@@ -24,6 +24,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LoanOpened},
     math::{
         band_id_for_trigger, mul_div, recompute_trigger, LoanSides, TriggerDirection,
         BPS_DENOM,
@@ -522,6 +523,19 @@ pub fn process_open_loan(
         direction_byte,
         trigger_price_wad
     );
+    LoanOpened {
+        pool: *pool_info.key,
+        loan: *loan_info.key,
+        borrower: *borrower_info.key,
+        nonce,
+        sides: sides_byte,
+        collateral_amount,
+        debt_amount,
+        band_id,
+        trigger_direction: direction_byte,
+        trigger_price_wad,
+    }
+    .emit();
     Ok(())
 }
 

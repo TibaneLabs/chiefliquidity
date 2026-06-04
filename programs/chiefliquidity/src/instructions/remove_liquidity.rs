@@ -17,6 +17,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LiquidityRemoved},
     math::mul_div,
     state::{is_valid_token_program, Pool, POOL_SEED},
 };
@@ -191,6 +192,14 @@ pub fn process_remove_liquidity(
         amount_a_out_u64,
         amount_b_out_u64
     );
+    LiquidityRemoved {
+        pool: *pool_info.key,
+        user: *user_info.key,
+        lp_burned: lp_amount,
+        amount_a_out: amount_a_out_u64,
+        amount_b_out: amount_b_out_u64,
+    }
+    .emit();
     Ok(())
 }
 

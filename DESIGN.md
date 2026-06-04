@@ -156,42 +156,63 @@ pub struct Pool {
     pub protocol_fee_bps: u16,           // 2    skim of swap_fee for treasury
     pub _curve_pad: [u8; 3],             // 3    padding to keep alignment readable
 
-    // Lending config
+    // Lending config (collateral health)
     pub liq_ratio_bps: u16,              // 2    e.g. 11000 = 110%
     pub liq_penalty_bps: u16,            // 2    bonus credited to pool on liquidation
     pub max_ltv_bps: u16,                // 2    initial borrow cap (< 1 / liq_ratio)
-    pub interest_rate_bps_per_year: u16, // 2    flat for v1; refine later
-    pub _lending_pad: [u8; 8],           // 8
+    pub _lending_pad: [u8; 2],           // 2
+
+    // Interest model — shared utilization-kink curve, applied per side (see §8).
+    pub interest_base_bps_per_year: u16,   // 2  APR at zero utilization
+    pub interest_slope1_bps_per_year: u16, // 2  added APR from 0 → kink
+    pub interest_slope2_bps_per_year: u16, // 2  added APR from kink → 100%
+    pub interest_kink_bps: u16,            // 2  kink point in bps of utilization
+
+    // Per-side borrow indexes (monotone, WAD-scaled, ≥ WAD). See §8.
+    pub borrow_index_a_wad: u128,        // 16   owed_a = principal·index_a/snapshot
+    pub borrow_index_b_wad: u128,        // 16
+    pub last_index_update_slot: u64,     // 8    slot both indexes last bumped
 
     // Loan-ordering index heads (see §6)
     pub head_fall: Pubkey,               // 32   Loan PDA at head of TriggerOnFall list
-                                         //      (highest trigger_price first — fires soonest on a fall)
     pub head_rise: Pubkey,               // 32   Loan PDA at head of TriggerOnRise list
-                                         //      (lowest trigger_price first — fires soonest on a rise)
-    pub band_count_fall: u32,            // 4    how many bands populated, for debugging only
-    pub band_count_rise: u32,            // 4
+    pub band_count_fall: u32,            // 4    populated OnFall bands (debug/telemetry)
+    pub band_count_rise: u32,            // 4    populated OnRise bands
 
     // Counters
     pub open_loans: u64,                 // 8
-    pub next_loan_nonce: u64,            // 8    monotonically increasing per borrower? see §5.3
+    pub next_loan_nonce: u64,            // 8    pool-monotonic; see §5.3
     pub last_update_slot: u64,           // 8
 
     // Treasury accounting
     pub protocol_fees_a: u64,            // 8    skimmed; redeemable by authority
     pub protocol_fees_b: u64,            // 8
 
-    pub _reserved: [u8; 64],             // 64   forward-compat
+    // Band-presence bitmaps (see §6.5). Bit i set ↔ a LoanIndexBand PDA exists
+    // for (pool, direction, band_id=i) with count > 0. 16 bytes = 128 bits;
+    // band ids ≥ 128 (MAX_BAND_ID = 127) are not representable.
+    pub band_bitmap_fall: [u8; 16],      // 16
+    pub band_bitmap_rise: [u8; 16],      // 16
+
+    pub _reserved: [u8; 32],             // 32   forward-compat
 }
 ```
 
-`LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×4 + 8) + (32×2 + 4×2) + 8×3 + 8×2 + 64
-= 8 + 192 + 4 + 64 + 8 + 16 + 72 + 24 + 16 + 64 = **468 bytes** (verified by
-`state::tests::pool_size` borsh roundtrip).
+`LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×3 + 2) + 2×4 + (16×2 + 8)
++ (32×2 + 4×2) + 8×3 + 8×2 + 16×2 + 32
+= 8 + 192 + 4 + 64 + 8 + 8 + 8 + 40 + 72 + 24 + 16 + 32 + 32 = **508 bytes**
+(verified by `state::tests::pool_size` borsh roundtrip).
 
 Notes:
 - `authority` is renounceable by setting to `Pubkey::default()`, same convention as
   `StakingPool`.
 - All `Pubkey` head pointers default to `Pubkey::default()` for an empty list.
+- The interest model started as a flat APR (one `interest_rate_bps_per_year`
+  field); it now stores the four-parameter utilization-kink curve plus the two
+  per-side borrow indexes that capitalize accrued interest lazily — see §8.
+- `band_bitmap_*` are the on-chain source of truth for "which bands are
+  populated", letting a swap prove it supplied every band a price move could
+  cross without an off-chain `getProgramAccounts` walk — see §6.5.
 - Reserved bytes mirror chiefstaker's pattern of leaving room for new fields with
   `unwrap_or(0)` deserialize.
 
@@ -216,8 +237,8 @@ pub struct Loan {
     // Amounts (raw token units)
     pub collateral_amount: u128,         // 16
     pub debt_principal: u128,            // 16   never increases after open
-    pub debt_accrued: u128,              // 16   interest accumulator since last touch
-    pub last_accrual_slot: u64,          // 8
+    pub borrow_index_snapshot_wad: u128, // 16   pool index for this debt side at open/last-touch
+    pub last_touch_slot: u64,            // 8    slot accrual was last realized (informational)
 
     // Liquidation-trigger cache (recomputed on every collateral / debt change)
     // Stored as fixed-point 128-bit price in B-per-A units, WAD-scaled (1e18).
@@ -225,7 +246,7 @@ pub struct Loan {
     pub trigger_direction: u8,           // 1    0 = TriggerOnFall, 1 = TriggerOnRise
 
     // Status
-    pub status: u8,                      // 1    0 = open, 1 = closed-by-repay, 2 = liquidated, 3 = partial
+    pub status: u8,                      // 1    0 = open, 1 = closed-by-repay, 2 = liquidated
     pub _status_pad: [u8; 6],            // 6
 
     // Lifecycle
@@ -370,20 +391,32 @@ On-chain:
 ### 6.5 Completeness verification (the subtle part)
 
 The program must reject input that **omits** a triggered loan that should have
-fired. The check is:
+fired. The implemented check (see `instructions/swap.rs`) has three layers:
 
-For each band that is fully crossed by the price move (band's `max_trigger_wad`
-is past `post_price`), the caller must supply **every** link in that band — i.e.
-the supplied chain length must equal `band.count`, and `last_supplied.next ==
-default()`.
+1. **Per-band wholeness.** For every band the caller supplies, the supplied
+   link count must equal `band.count`, the first supplied link must equal
+   `band.head_link`, each `link[i].prev` must equal `link[i-1]`, and the last
+   supplied link's `next` must be `default()`. A caller therefore cannot hand
+   over a partial band — it's all-or-nothing per band.
 
-For the band that contains `post_price`, the caller supplies links from
-`head_link` until the next link's `trigger_price_wad` is past `post_price`. The
-program verifies that the *first un-supplied* link's `trigger_price_wad`, read
-from the last supplied link's `next` pointer, is past `post_price`. That requires
-the caller to supply one extra "sentinel" link account (read-only) so the program
-can verify the stop condition without writing to it — unless the next pointer is
-`default()`.
+2. **Bitmap coverage.** The caller passes a `band_boundary: u32` asserting how
+   far the price moves: for a falling price (`a_to_b`, OnFall) the post-swap
+   band id is `≥ band_boundary`; for a rising price (`b_to_a`, OnRise) it is
+   `≤ band_boundary`. The program walks the pool's `band_bitmap_{fall,rise}`
+   over the implied id range (`[band_boundary, MAX]` or `[0, band_boundary]`)
+   and requires **every set bit** in that range to correspond to a supplied
+   band. Because the bitmap is the on-chain source of truth for "this band has
+   loans", a caller cannot silently drop a populated band on the path.
+
+3. **Post-cascade boundary recheck.** After the liquidation loop settles and
+   the final swap is quoted, the program recomputes the true post-swap price's
+   band id and reverts (`IncompleteBandWalk`) if the cascade pushed the price
+   *past* the caller's claimed `band_boundary` — i.e. if more bands could have
+   triggered than were proven complete in step 2.
+
+This bitmap scheme replaces the original "sentinel link" stop-condition design:
+the pool carries the populated-band set directly, so the program never has to
+read an extra read-only link to learn where the chain ends.
 
 ### 6.6 Bounded liquidation per swap
 
@@ -407,8 +440,14 @@ spans `[$50, $800]` in ~57 bands. That's a lot of PDAs. Alternatives:
 
 Suggested default: log base 2 bands (small fixed set), intra-band linked list,
 with a hard cap on intra-band count (e.g. 64) that forces band subdivision when
-exceeded. Subdivision is implemented as a separate `RebalanceBands` instruction,
-not as part of swap. Keeps swap path simple.
+exceeded.
+
+**As implemented:** `LoanIndexBand::MAX_LINKS = 64`, and `OpenLoan` reverts with
+`BandFull` once a band is saturated. The `RebalanceBands` subdivision
+instruction is **not yet implemented** — a saturated band currently has no
+on-chain remedy beyond repaying/liquidating its loans. The bitmap (§6.5) caps
+band ids at `MAX_BAND_ID = 127`. Subdivision remains the planned escape hatch
+and is tracked as future work (see §9.4).
 
 ---
 
@@ -484,8 +523,25 @@ Failure modes:
 - `recompute_trigger(loan) → (trigger_price_wad, direction)` — closed form per
   §3 table.
 - `next_band_in_direction(current_band, direction)` — `+1` or `-1`.
-- Interest accrual: linear `debt_accrued += debt × rate × Δslots / SLOTS_PER_YEAR`
-  applied lazily on any loan touch. Refine to compounding later.
+- Interest accrual (**implemented as a per-side index model**, not the flat
+  accumulator originally sketched here):
+  - Utilization per side: `util = total_debt_x / accounted_x`, WAD-scaled
+    (`utilization_wad`).
+  - Borrow rate: a two-slope **utilization-kink** curve
+    (`compute_borrow_rate_wad_per_year`):
+    - `util ≤ kink`: `rate = base + slope1 · util / kink`
+    - `util > kink`: `rate = base + slope1 + slope2 · (util − kink) / (1 − kink)`
+  - Each side carries a monotone `borrow_index_x_wad` (starts at WAD). On any
+    pool touch (add/remove liquidity, open/repay loan, swap, settings update),
+    `Pool::bump_indexes` advances both indexes by
+    `index ·= 1 + rate_per_slot · Δslots` (`bump_index_wad`, linear within a
+    bump — a slight under-estimate of `e^{rt}` over long idle windows).
+  - A loan stores `borrow_index_snapshot_wad` at open; the amount owed is
+    `debt_principal · current_index / snapshot` (`owed_from_index`). On repay,
+    accrued interest (owed − principal) stays in the vault as LP yield; on
+    liquidation it is forfeited (the principal is written off, not paid).
+  - Indexes are always bumped at the rate in effect *before* a parameter change
+    (`UpdatePoolSettings` bumps first), so retuning the curve is prospective.
 
 ---
 
@@ -493,8 +549,10 @@ Failure modes:
 
 1. **CPMM vs. concentrated** — sticking with CPMM for v1. Concentrated would
    change reserve math meaningfully; revisit after v1 ships.
-2. **Interest model** — flat APR is a placeholder. Probably a utilization curve
-   à la Aave but simpler.
+2. **Interest model** — ✅ resolved. Implemented as a per-side
+   utilization-kink curve with monotone borrow indexes (§8), retunable via
+   `UpdatePoolSettings`. Linear-within-bump accrual; compounding refinement
+   deferred.
 3. **Oracle** — no external oracle in v1. Trigger prices are denominated in the
    pool's own price (B-per-A). This means the *only* signal driving liquidation
    is real swap activity. That's the design intent (§ project spec) but worth
@@ -515,16 +573,59 @@ Failure modes:
 
 ---
 
-## 10. Files to touch when implementing (preview)
+## 10. Implementation status (by file)
 
-- `programs/chiefliquidity/src/state.rs` — accounts §5
-- `programs/chiefliquidity/src/math.rs` — quoting + trigger derivation §3, §8
-- `programs/chiefliquidity/src/instructions/initialize_pool.rs`
-- `programs/chiefliquidity/src/instructions/add_liquidity.rs`
-- `programs/chiefliquidity/src/instructions/remove_liquidity.rs`
-- `programs/chiefliquidity/src/instructions/open_loan.rs`     — also creates LoanLink, inserts into band
-- `programs/chiefliquidity/src/instructions/repay_loan.rs`    — also unlinks
-- `programs/chiefliquidity/src/instructions/swap.rs`          — §7
-- `programs/chiefliquidity/src/instructions/rebalance_bands.rs` — band subdivision
-- `programs/chiefliquidity/src/error.rs`
-- `programs/chiefliquidity/src/events.rs`
+| File | Status | Notes |
+|------|--------|-------|
+| `state.rs` | ✅ | Accounts §5; `Pool` carries the §6.5 band bitmaps + §8 indexes |
+| `math.rs` | ✅ | CPMM quoting §8, trigger derivation §3, utilization-kink interest §8 |
+| `events.rs` | ✅ | Structured `sol_log_data` events (§11) |
+| `error.rs` | ✅ | |
+| `instructions/initialize_pool.rs` | ✅ | Validates Token-2022 extensions, creates vaults + LP mint |
+| `instructions/add_liquidity.rs` | ✅ | |
+| `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate |
+| `instructions/open_loan.rs` | ✅ | Also creates LoanLink, allocates/inserts into band |
+| `instructions/repay_loan.rs` | ✅ | Also unlinks; refunds Loan/LoanLink/empty-Band rent |
+| `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |
+| `instructions/claim_protocol_fees.rs` | ✅ | Authority-only treasury drain |
+| `instructions/transfer_authority.rs` | ✅ | Rotate / renounce |
+| `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |
+| `instructions/update_pool_settings.rs` | ✅ | Prospective param retune |
+| `instructions/rebalance_bands.rs` | ❌ | **Not implemented** — band subdivision; see §6.7 |
+
+Integration tests live in the separate `integration-tests/` cargo project
+(`solana-program-test`), kept out of the deployable crate's lockfile so the
+verifiable-build container (cargo 1.78) can parse it.
+
+---
+
+## 11. Events
+
+Every state-changing instruction emits one structured event (and per-liquidation
+events from `Swap`) via `sol_log_data`, defined in `events.rs`. The wire format
+of each `Program data:` line is:
+
+```
+discriminator (8 bytes, random sentinel, leads with 0xe_) ++ borsh(payload)
+```
+
+Off-chain consumers match on the first 8 bytes, then borsh-deserialize the
+remainder into the matching struct. Emission is best-effort: a serialization
+failure is swallowed so a dropped log line can never revert committed state.
+
+| Event | Emitted by | Key fields |
+|-------|-----------|------------|
+| `PoolInitialized` | `InitializePool` | pool, mints, authority, full config |
+| `LiquidityAdded` | `AddLiquidity` | pool, user, amount_a/b_in, lp_minted |
+| `LiquidityRemoved` | `RemoveLiquidity` | pool, user, lp_burned, amount_a/b_out |
+| `LoanOpened` | `OpenLoan` | pool, loan, borrower, sides, amounts, band, trigger |
+| `LoanRepaid` | `RepayLoan` | pool, loan, borrower, debt_principal, total_owed |
+| `LoanLiquidated` | `Swap` (per loan) | pool, loan, borrower, sides, collateral, debt, trigger |
+| `SwapExecuted` | `Swap` | pool, user, a_to_b, amount_in/out, liquidations, protocol_fee |
+| `ProtocolFeesClaimed` | `ClaimProtocolFees` | pool, authority, amount_a/b |
+| `AuthorityTransferred` | `TransferAuthority` | pool, old_authority, new_authority |
+| `LiquidatedRentClaimed` | `ClaimLiquidatedRent` | pool, loan, borrower |
+| `PoolSettingsUpdated` | `UpdatePoolSettings` | pool, full config |
+
+Discriminators are pinned and round-trip-tested in `events::tests`; they are
+disjoint from account discriminators (which lead with `0xa_`–`0xd_`).

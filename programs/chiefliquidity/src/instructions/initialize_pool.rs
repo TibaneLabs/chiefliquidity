@@ -29,6 +29,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, PoolInitialized},
     math::BPS_DENOM,
     state::{
         is_valid_token_program, CurveKind, Pool, LP_MINT_SEED, POOL_DISCRIMINATOR,
@@ -285,6 +286,22 @@ pub fn process_initialize_pool(
         mint_a_info.key,
         mint_b_info.key
     );
+    PoolInitialized {
+        pool: *pool_info.key,
+        mint_a: *mint_a_info.key,
+        mint_b: *mint_b_info.key,
+        authority: *authority_info.key,
+        swap_fee_bps,
+        protocol_fee_bps,
+        liq_ratio_bps,
+        liq_penalty_bps,
+        max_ltv_bps,
+        interest_base_bps_per_year,
+        interest_slope1_bps_per_year,
+        interest_slope2_bps_per_year,
+        interest_kink_bps,
+    }
+    .emit();
     Ok(())
 }
 

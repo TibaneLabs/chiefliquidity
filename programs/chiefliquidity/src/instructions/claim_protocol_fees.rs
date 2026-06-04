@@ -15,6 +15,7 @@ use spl_token_2022::{extension::StateWithExtensions, state::Mint};
 
 use crate::{
     error::LiquidityError,
+    events::{Event, ProtocolFeesClaimed},
     state::{is_valid_token_program, Pool, POOL_SEED},
 };
 
@@ -137,6 +138,13 @@ pub fn process_claim_protocol_fees(
         amount_b,
         authority_info.key
     );
+    ProtocolFeesClaimed {
+        pool: *pool_info.key,
+        authority: *authority_info.key,
+        amount_a,
+        amount_b,
+    }
+    .emit();
     Ok(())
 }
 

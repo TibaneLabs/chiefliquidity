@@ -31,6 +31,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
+    events::{Event, LoanLiquidated, SwapExecuted},
     math::{
         band_id_for_trigger, cpmm_quote_out, is_liquidatable, price_b_per_a_wad, LoanSides,
         TriggerDirection, BPS_DENOM,
@@ -581,6 +582,16 @@ pub fn process_swap(
         amount_out_u64,
         liq_count
     );
+    SwapExecuted {
+        pool: *pool_info.key,
+        user: *user_info.key,
+        a_to_b,
+        amount_in,
+        amount_out: amount_out_u64,
+        liquidations: liq_count,
+        protocol_fee: protocol_portion,
+    }
+    .emit();
     Ok(())
 }
 
@@ -633,6 +644,17 @@ fn persist_liquidations(
                 // the account; borrower can reclaim later.
                 let mut loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
                     .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+                // Capture pre-zero values for the event.
+                LoanLiquidated {
+                    pool: loan.pool,
+                    loan: *loan_info.key,
+                    borrower: loan.borrower,
+                    sides: lc.sides as u8,
+                    collateral_amount: lc.collateral,
+                    debt_principal: lc.debt_principal,
+                    trigger_price_wad: lc.trigger_wad,
+                }
+                .emit();
                 loan.collateral_amount = 0;
                 loan.debt_principal = 0;
                 loan.status = Loan::STATUS_LIQUIDATED;

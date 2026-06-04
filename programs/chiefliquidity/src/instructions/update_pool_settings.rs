@@ -20,6 +20,7 @@ use spl_token_2022::state::Account as TokenAccount;
 
 use crate::{
     error::LiquidityError,
+    events::{Event, PoolSettingsUpdated},
     instructions::initialize_pool::validate_params,
     state::Pool,
 };
@@ -97,8 +98,10 @@ pub fn process_update_pool_settings(
     pool.interest_slope2_bps_per_year = interest_slope2_bps_per_year;
     pool.interest_kink_bps = interest_kink_bps;
     pool.last_update_slot = clock.slot;
-    let mut data = pool_info.try_borrow_mut_data()?;
-    pool.serialize(&mut &mut data[..])?;
+    {
+        let mut data = pool_info.try_borrow_mut_data()?;
+        pool.serialize(&mut &mut data[..])?;
+    }
 
     msg!(
         "UpdatePoolSettings swap_fee={} prot_fee={} liq_ratio={} liq_pen={} max_ltv={} base={} s1={} s2={} kink={}",
@@ -112,6 +115,19 @@ pub fn process_update_pool_settings(
         interest_slope2_bps_per_year,
         interest_kink_bps
     );
+    PoolSettingsUpdated {
+        pool: *pool_info.key,
+        swap_fee_bps,
+        protocol_fee_bps,
+        liq_ratio_bps,
+        liq_penalty_bps,
+        max_ltv_bps,
+        interest_base_bps_per_year,
+        interest_slope1_bps_per_year,
+        interest_slope2_bps_per_year,
+        interest_kink_bps,
+    }
+    .emit();
     Ok(())
 }
 

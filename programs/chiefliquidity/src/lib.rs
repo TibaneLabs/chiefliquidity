@@ -6,7 +6,7 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
-    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, msg,
+    account_info::AccountInfo, entrypoint::ProgramResult, msg,
     program_error::ProgramError, pubkey::Pubkey,
 };
 
@@ -266,7 +266,7 @@ pub enum LiquidityInstruction {
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
-entrypoint!(process_instruction);
+solana_program::entrypoint!(process_instruction);
 
 #[cfg(not(feature = "no-entrypoint"))]
 use solana_security_txt::security_txt;

@@ -14,7 +14,11 @@ use solana_program::{
     sysvar::Sysvar,
 };
 
-use crate::{error::LiquidityError, state::Pool};
+use crate::{
+    error::LiquidityError,
+    events::{AuthorityTransferred, Event},
+    state::Pool,
+};
 
 pub fn process_transfer_authority(
     program_id: &Pubkey,
@@ -47,15 +51,24 @@ pub fn process_transfer_authority(
     }
 
     let was_renounce = new_authority == Pubkey::default();
+    let old_authority = pool.authority;
     pool.authority = new_authority;
     pool.last_update_slot = Clock::get()?.slot;
-    let mut data = pool_info.try_borrow_mut_data()?;
-    pool.serialize(&mut &mut data[..])?;
+    {
+        let mut data = pool_info.try_borrow_mut_data()?;
+        pool.serialize(&mut &mut data[..])?;
+    }
 
     if was_renounce {
         msg!("TransferAuthority: authority renounced");
     } else {
         msg!("TransferAuthority: new={}", new_authority);
     }
+    AuthorityTransferred {
+        pool: *pool_info.key,
+        old_authority,
+        new_authority,
+    }
+    .emit();
     Ok(())
 }
