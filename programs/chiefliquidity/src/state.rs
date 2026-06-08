@@ -12,14 +12,12 @@ pub const VAULT_A_SEED: &[u8] = b"vault_a";
 pub const VAULT_B_SEED: &[u8] = b"vault_b";
 pub const LP_MINT_SEED: &[u8] = b"lp_mint";
 pub const LOAN_SEED: &[u8] = b"loan";
-pub const LOAN_LINK_SEED: &[u8] = b"loan_link";
 pub const BAND_SEED: &[u8] = b"band";
 
 // ===== Account discriminators (random sentinels — not Anchor-derived) =====
 
 pub const POOL_DISCRIMINATOR: [u8; 8] = [0xa1, 0xc4, 0xe7, 0x12, 0x3b, 0x8f, 0xd5, 0x6e];
 pub const LOAN_DISCRIMINATOR: [u8; 8] = [0xb2, 0x7e, 0x3c, 0xa0, 0x91, 0x4d, 0x8e, 0x55];
-pub const LOAN_LINK_DISCRIMINATOR: [u8; 8] = [0xc3, 0x82, 0x1f, 0x6d, 0xb4, 0x59, 0xe2, 0x70];
 pub const LOAN_INDEX_BAND_DISCRIMINATOR: [u8; 8] =
     [0xd4, 0x95, 0x3a, 0x71, 0x68, 0x2e, 0xc1, 0x88];
 
@@ -103,12 +101,6 @@ pub struct Pool {
     /// Slot at which both indexes were last bumped.
     pub last_index_update_slot: u64,
 
-    // Loan-ordering index heads (DESIGN.md §6)
-    pub head_fall: Pubkey,
-    pub head_rise: Pubkey,
-    pub band_count_fall: u32,
-    pub band_count_rise: u32,
-
     // Counters
     pub open_loans: u64,
     pub next_loan_nonce: u64,
@@ -139,7 +131,6 @@ impl Pool {
         + 2 * 2 + 2                           // liq_ratio_bps, max_ltv_bps + _lending_pad
         + 2 * 4                               // 4× u16 interest model params
         + 16 * 2 + 8                          // borrow_index_a/b_wad + last_index_update_slot
-        + 32 * 2 + 4 * 2                      // head_fall, head_rise, band_count_fall, band_count_rise
         + 8 * 3                               // open_loans, next_loan_nonce, last_update_slot
         + 8 * 2                               // protocol_fees_a, protocol_fees_b
         + 16 * 2                              // band_bitmap_fall, band_bitmap_rise
@@ -383,10 +374,15 @@ pub struct Loan {
     pub status: u8,
     pub _status_pad: [u8; 6],
 
+    /// Band bucket = `band_id_for_trigger(trigger_price_wad)`. Set once at open
+    /// (immutable, since `trigger_price_wad` never changes). Cached here so a
+    /// swap's completeness proof and off-chain band enumeration don't recompute.
+    pub band_id: u32,
+
     pub opened_slot: u64,
     pub closed_slot: u64,
 
-    pub _reserved: [u8; 32],
+    pub _reserved: [u8; 28],
 }
 
 impl Loan {
@@ -400,8 +396,9 @@ impl Loan {
         + 16                                  // trigger_price_wad
         + 1                                   // trigger_direction
         + 1 + 6                               // status + _status_pad
+        + 4                                   // band_id
         + 8 * 2                               // opened_slot, closed_slot
-        + 32;                                 // _reserved
+        + 28;                                 // _reserved
 
     pub const STATUS_OPEN: u8 = 0;
     pub const STATUS_REPAID: u8 = 1;
@@ -438,61 +435,16 @@ impl Loan {
     }
 }
 
-// ===== LoanLink =====
-
-/// Doubly-linked list node for the loan-ordering index. PDA:
-/// `["loan_link", pool, loan]`.
-///
-/// `prev`/`next` point to other `LoanLink` PDAs (default = chain end).
-/// `trigger_price_wad` is denormalized from `Loan` so a swap doesn't have to
-/// load the full `Loan` to decide whether the chain stops.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub struct LoanLink {
-    pub discriminator: [u8; 8],
-
-    pub pool: Pubkey,
-    pub loan: Pubkey,
-
-    pub band_id: u32,
-    pub direction: u8,
-    pub bump: u8,
-    pub _pad: [u8; 2],
-
-    pub prev: Pubkey,
-    pub next: Pubkey,
-    pub trigger_price_wad: u128,
-
-    pub _reserved: [u8; 16],
-}
-
-impl LoanLink {
-    pub const LEN: usize = 8                 // discriminator
-        + 32 * 2                              // pool, loan
-        + 4 + 1 + 1 + 2                       // band_id, direction, bump, _pad
-        + 32 * 2                              // prev, next
-        + 16                                  // trigger_price_wad
-        + 16;                                 // _reserved
-
-    pub fn is_initialized(&self) -> bool {
-        self.discriminator == LOAN_LINK_DISCRIMINATOR
-    }
-
-    pub fn derive_pda(
-        pool: &Pubkey,
-        loan: &Pubkey,
-        program_id: &Pubkey,
-    ) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[LOAN_LINK_SEED, pool.as_ref(), loan.as_ref()],
-            program_id,
-        )
-    }
-}
-
 // ===== LoanIndexBand =====
 
-/// Bucket head for one (pool, direction, band_id). PDA:
+/// Membership counter for one (pool, direction, band_id) bucket. PDA:
 /// `["band", pool, direction_byte, band_id_le_bytes]`.
+///
+/// The band stores only how many open loans fall in its 2× price bucket — not
+/// *which* ones. A swap proves it supplied a band's full membership by checking
+/// it was handed exactly `count` distinct open loans whose cached `band_id` and
+/// `direction` match (see `DESIGN.md` §6). The Pool bitmap (`band_bitmap_*`)
+/// tracks which bands have `count > 0`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct LoanIndexBand {
     pub discriminator: [u8; 8],
@@ -503,13 +455,8 @@ pub struct LoanIndexBand {
     pub bump: u8,
     pub _pad: [u8; 2],
 
-    pub head_link: Pubkey,
-    pub tail_link: Pubkey,
     pub count: u32,
     pub _pad2: [u8; 4],
-
-    pub min_trigger_wad: u128,
-    pub max_trigger_wad: u128,
 
     pub _reserved: [u8; 32],
 }
@@ -518,14 +465,14 @@ impl LoanIndexBand {
     pub const LEN: usize = 8                 // discriminator
         + 32                                  // pool
         + 4 + 1 + 1 + 2                       // band_id, direction, bump, _pad
-        + 32 * 2                              // head_link, tail_link
         + 4 + 4                               // count, _pad2
-        + 16 * 2                              // min/max trigger
         + 32;                                 // _reserved
 
-    /// Hard cap on intra-band link count. When exceeded, callers must use
-    /// `RebalanceBands` to subdivide before opening more loans in this band.
-    pub const MAX_LINKS: u32 = 64;
+    /// Hard cap on open loans per band. `OpenLoan` reverts with `BandFull` once
+    /// a band's 2× price bucket holds this many loans; the bound keeps a swap's
+    /// supplied account list (which must include a crossed band's full
+    /// membership) within tx limits. See `DESIGN.md` §6.7.
+    pub const MAX_LOANS: u32 = 64;
 
     pub fn is_initialized(&self) -> bool {
         self.discriminator == LOAN_INDEX_BAND_DISCRIMINATOR
@@ -586,10 +533,6 @@ mod tests {
             borrow_index_a_wad: crate::math::WAD,
             borrow_index_b_wad: crate::math::WAD,
             last_index_update_slot: 0,
-            head_fall: Pubkey::default(),
-            head_rise: Pubkey::default(),
-            band_count_fall: 0,
-            band_count_rise: 0,
             open_loans: 0,
             next_loan_nonce: 0,
             last_update_slot: 0,
@@ -617,25 +560,10 @@ mod tests {
             trigger_direction: 0,
             status: Loan::STATUS_OPEN,
             _status_pad: [0; 6],
+            band_id: 7,
             opened_slot: 0,
             closed_slot: 0,
-            _reserved: [0; 32],
-        }
-    }
-
-    fn fake_loan_link() -> LoanLink {
-        LoanLink {
-            discriminator: LOAN_LINK_DISCRIMINATOR,
-            pool: Pubkey::new_unique(),
-            loan: Pubkey::new_unique(),
-            band_id: 7,
-            direction: 0,
-            bump: 255,
-            _pad: [0; 2],
-            prev: Pubkey::default(),
-            next: Pubkey::default(),
-            trigger_price_wad: 2_200_000_000_000_000_000,
-            _reserved: [0; 16],
+            _reserved: [0; 28],
         }
     }
 
@@ -647,12 +575,8 @@ mod tests {
             direction: 0,
             bump: 255,
             _pad: [0; 2],
-            head_link: Pubkey::default(),
-            tail_link: Pubkey::default(),
             count: 0,
             _pad2: [0; 4],
-            min_trigger_wad: 0,
-            max_trigger_wad: 0,
             _reserved: [0; 32],
         }
     }
@@ -669,13 +593,6 @@ mod tests {
         let l = fake_loan();
         let v = borsh::to_vec(&l).unwrap();
         assert_eq!(v.len(), Loan::LEN);
-    }
-
-    #[test]
-    fn loan_link_size() {
-        let l = fake_loan_link();
-        let v = borsh::to_vec(&l).unwrap();
-        assert_eq!(v.len(), LoanLink::LEN);
     }
 
     #[test]
@@ -703,18 +620,8 @@ mod tests {
         let l2 = Loan::try_from_slice(&v).unwrap();
         assert_eq!(l2.collateral_amount, 50);
         assert_eq!(l2.debt_principal, 100);
-        assert!(l2.is_open());
-    }
-
-    #[test]
-    fn loan_link_roundtrip() {
-        let l = fake_loan_link();
-        let v = borsh::to_vec(&l).unwrap();
-        let l2 = LoanLink::try_from_slice(&v).unwrap();
         assert_eq!(l2.band_id, 7);
-        assert_eq!(l2.direction, 0);
-        assert_eq!(l2.prev, Pubkey::default());
-        assert_eq!(l2.next, Pubkey::default());
+        assert!(l2.is_open());
     }
 
     #[test]
@@ -859,9 +766,8 @@ mod tests {
     /// guard against accidental layout breakage.
     #[test]
     fn known_sizes() {
-        assert_eq!(Pool::LEN, 506);
+        assert_eq!(Pool::LEN, 434);
         assert_eq!(Loan::LEN, 210);
-        assert_eq!(LoanLink::LEN, 176);
-        assert_eq!(LoanIndexBand::LEN, 184);
+        assert_eq!(LoanIndexBand::LEN, 88);
     }
 }

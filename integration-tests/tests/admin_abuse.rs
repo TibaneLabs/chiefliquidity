@@ -279,7 +279,7 @@ async fn swap_with_wrong_vault_rejected() {
         min_out: 1,
         a_to_b: true,
         band_boundary: 0,
-        band_link_counts: vec![],
+        band_loan_counts: vec![],
     };
     let ix = solana_program::instruction::Instruction {
         program_id: env.program_id,

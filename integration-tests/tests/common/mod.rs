@@ -9,9 +9,9 @@
 
 #![allow(dead_code)]
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use chiefliquidity::{
-    state::{bitmap_is_set, Loan, LoanIndexBand, LoanLink, Pool},
+    state::{bitmap_is_set, Loan, LoanIndexBand, Pool},
     LiquidityInstruction,
 };
 use solana_program::{
@@ -76,6 +76,12 @@ pub struct TestEnv {
     pub mint_a_decimals: u8,
     pub mint_b_decimals: u8,
     pub token_program: Pubkey,
+    /// Every loan ever opened via `open_loan`, as `(loan_pda, band_id,
+    /// direction)`. A superset of the currently-open set — `swap_full` filters
+    /// it by on-chain `is_open` status, so repaid/liquidated loans drop out
+    /// without needing removal. Lets `swap_full` reconstruct each band's
+    /// membership now that bands store only a count, not a member list.
+    pub opened_loans: Vec<(Pubkey, u32, u8)>,
 }
 
 impl TestEnv {
@@ -139,6 +145,7 @@ impl TestEnv {
             mint_a_decimals,
             mint_b_decimals,
             token_program,
+            opened_loans: Vec::new(),
         }
     }
 
@@ -158,9 +165,6 @@ impl TestEnv {
     }
     pub fn loan_pda(&self, borrower: &Pubkey, nonce: u64) -> (Pubkey, u8) {
         Loan::derive_pda(&self.pool_pda().0, borrower, nonce, &self.program_id)
-    }
-    pub fn loan_link_pda(&self, loan: &Pubkey) -> (Pubkey, u8) {
-        LoanLink::derive_pda(&self.pool_pda().0, loan, &self.program_id)
     }
     pub fn band_pda(&self, direction: u8, band_id: u32) -> (Pubkey, u8) {
         LoanIndexBand::derive_pda(&self.pool_pda().0, direction, band_id, &self.program_id)
@@ -447,14 +451,6 @@ impl TestEnv {
             .and_then(|acc| Loan::try_from_slice(&acc.data).ok())
     }
 
-    pub async fn loan_link_state(&mut self, link_pda: &Pubkey) -> Option<LoanLink> {
-        self.banks_client
-            .get_account(*link_pda)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|acc| LoanLink::try_from_slice(&acc.data).ok())
-    }
 
     /// Build + submit an OpenLoan instruction. Returns the assigned nonce
     /// (= pool.next_loan_nonce at call time) so the test can rederive the
@@ -473,7 +469,6 @@ impl TestEnv {
         let liq_ratio = pool.liq_ratio_bps;
 
         let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
-        let (link_pda, _) = self.loan_link_pda(&loan_pda);
 
         let sides_enum =
             chiefliquidity::math::LoanSides::from_u8(sides).expect("sides byte");
@@ -487,14 +482,6 @@ impl TestEnv {
         let band_id =
             chiefliquidity::math::band_id_for_trigger(trigger_wad).expect("band_id");
         let (band_pda, _) = self.band_pda(dir as u8, band_id);
-
-        // Old tail: existing band tail if non-empty; else placeholder = link_pda.
-        let old_tail = self
-            .band_state(dir as u8, band_id)
-            .await
-            .filter(|b| b.count > 0)
-            .map(|b| b.tail_link)
-            .unwrap_or(link_pda);
 
         let data = LiquidityInstruction::OpenLoan {
             sides,
@@ -514,15 +501,14 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
                 AccountMeta::new(borrower.pubkey(), true),
                 AccountMeta::new(loan_pda, false),
-                AccountMeta::new(link_pda, false),
                 AccountMeta::new(band_pda, false),
-                AccountMeta::new(old_tail, false),
                 AccountMeta::new_readonly(solana_program::system_program::id(), false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
         };
         self.send_with_new_blockhash(&[ix], &[borrower]).await?;
+        self.opened_loans.push((loan_pda, band_id, dir as u8));
         Ok(nonce)
     }
 
@@ -535,24 +521,8 @@ impl TestEnv {
         nonce: u64,
     ) -> Result<(), TransportError> {
         let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
-        let (link_pda, _) = self.loan_link_pda(&loan_pda);
-        let link = self
-            .loan_link_state(&link_pda)
-            .await
-            .expect("loan_link not found");
-        let (band_pda, _) = self.band_pda(link.direction, link.band_id);
-
-        // Prev/next: if default, pass link itself as placeholder.
-        let prev = if link.prev == Pubkey::default() {
-            link_pda
-        } else {
-            link.prev
-        };
-        let next = if link.next == Pubkey::default() {
-            link_pda
-        } else {
-            link.next
-        };
+        let loan = self.loan_state(&loan_pda).await.expect("loan not found");
+        let (band_pda, _) = self.band_pda(loan.trigger_direction, loan.band_id);
 
         let data = LiquidityInstruction::RepayLoan;
         let ix = Instruction {
@@ -567,10 +537,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
                 AccountMeta::new(borrower.pubkey(), true),
                 AccountMeta::new(loan_pda, false),
-                AccountMeta::new(link_pda, false),
                 AccountMeta::new(band_pda, false),
-                AccountMeta::new(prev, false),
-                AccountMeta::new(next, false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
@@ -581,8 +548,8 @@ impl TestEnv {
     // ---- Swap helpers ----
 
     /// Build and submit a Swap instruction with explicit per-band context.
-    /// `bands` is `[(band_id, [(link_pda, loan_pda), ...]), ...]` in
-    /// chain order (band.head_link forward via .next pointers).
+    /// `bands` is `[(band_id, [loan_pda, ...]), ...]`. Each band's loans are
+    /// sorted ascending by pubkey here (the program requires it).
     #[allow(clippy::too_many_arguments)]
     pub async fn swap(
         &mut self,
@@ -593,7 +560,7 @@ impl TestEnv {
         min_out: u64,
         a_to_b: bool,
         band_boundary: u32,
-        bands: &[(u32, Vec<(Pubkey, Pubkey)>)],
+        bands: &[(u32, Vec<Pubkey>)],
     ) -> Result<(), TransportError> {
         let mut accounts = vec![
             AccountMeta::new(self.pool_pda().0, false),
@@ -607,16 +574,15 @@ impl TestEnv {
             AccountMeta::new_readonly(self.token_program, false),
         ];
         let direction: u8 = if a_to_b { 0 } else { 1 };
-        let mut band_link_counts = Vec::with_capacity(bands.len());
-        for (band_id, chain) in bands {
-            band_link_counts.push(chain.len() as u8);
+        let mut band_loan_counts = Vec::with_capacity(bands.len());
+        for (band_id, loans) in bands {
+            band_loan_counts.push(loans.len() as u8);
             let (band_pda, _) = self.band_pda(direction, *band_id);
             accounts.push(AccountMeta::new(band_pda, false));
-            for (link, _) in chain {
-                accounts.push(AccountMeta::new(*link, false));
-            }
-            for (_, loan) in chain {
-                accounts.push(AccountMeta::new(*loan, false));
+            let mut sorted = loans.clone();
+            sorted.sort();
+            for loan in sorted {
+                accounts.push(AccountMeta::new(loan, false));
             }
         }
         let data = LiquidityInstruction::Swap {
@@ -624,7 +590,7 @@ impl TestEnv {
             min_out,
             a_to_b,
             band_boundary,
-            band_link_counts,
+            band_loan_counts,
         };
         let ix = Instruction {
             program_id: self.program_id,
@@ -635,10 +601,11 @@ impl TestEnv {
     }
 
     /// Convenience: enumerate every populated band in the swap-relevant
-    /// direction (entire bitmap) and walk each band's chain. Yields the
-    /// `bands` argument for `swap` along with a wide-open boundary that
-    /// covers any cascade. Use this for happy-path tests that don't care
-    /// about minimizing the supplied account list.
+    /// direction (entire bitmap) and reconstruct each band's membership from
+    /// the harness-tracked `opened_loans`, filtered to those still open
+    /// on-chain. Yields the `bands` argument for `swap` along with a wide-open
+    /// boundary that covers any cascade. Use this for happy-path tests that
+    /// don't care about minimizing the supplied account list.
     pub async fn swap_full(
         &mut self,
         user: &Keypair,
@@ -656,20 +623,30 @@ impl TestEnv {
             pool.band_bitmap_rise
         };
         let boundary: u32 = if a_to_b { 0 } else { 127 };
-        let mut bands = Vec::new();
+
+        // Candidate loans for this direction, from the tracked superset.
+        let candidates: Vec<(Pubkey, u32)> = self
+            .opened_loans
+            .iter()
+            .filter(|(_, _, dir)| *dir == direction)
+            .map(|(loan, band_id, _)| (*loan, *band_id))
+            .collect();
+
+        let mut bands: Vec<(u32, Vec<Pubkey>)> = Vec::new();
         for band_id in 0u32..=127 {
             if !bitmap_is_set(&bitmap, band_id) {
                 continue;
             }
-            let band = self.band_state(direction, band_id).await.unwrap();
-            let mut chain = Vec::new();
-            let mut cur = band.head_link;
-            while cur != Pubkey::default() {
-                let link = self.loan_link_state(&cur).await.unwrap();
-                chain.push((cur, link.loan));
-                cur = link.next;
+            let mut loans = Vec::new();
+            for (loan_pda, _) in candidates.iter().filter(|(_, lb)| *lb == band_id) {
+                // Only loans still open on-chain are band members.
+                if let Some(loan) = self.loan_state(loan_pda).await {
+                    if loan.is_open() {
+                        loans.push(*loan_pda);
+                    }
+                }
             }
-            bands.push((band_id, chain));
+            bands.push((band_id, loans));
         }
         self.swap(user, ata_a, ata_b, amount_in, min_out, a_to_b, boundary, &bands)
             .await
@@ -755,13 +732,11 @@ impl TestEnv {
         nonce: u64,
     ) -> Result<(), TransportError> {
         let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
-        let (link_pda, _) = self.loan_link_pda(&loan_pda);
         let data = LiquidityInstruction::ClaimLiquidatedRent;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(loan_pda, false),
-                AccountMeta::new(link_pda, false),
                 AccountMeta::new(borrower.pubkey(), true),
             ],
             data: borsh::to_vec(&data).unwrap(),

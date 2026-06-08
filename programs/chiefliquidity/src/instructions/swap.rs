@@ -2,7 +2,10 @@
 //!
 //! High-level flow:
 //!   1. Load pool, vault balances, accounted/swappable reserves.
-//!   2. Parse the variable account tail into per-band `(band, [links], [loans])`.
+//!   2. Parse the variable account tail into per-band `(band, [loans])` and
+//!      prove each supplied band's membership is complete (§6.5): exactly
+//!      `band.count` distinct open loans, sorted ascending by pubkey, each with
+//!      matching `band_id` and `direction`.
 //!   3. Iteratively: compute post-swap price → find next supplied loan that's
 //!      triggered (direction matches, trigger crosses post_price) → liquidate
 //!      → recompute. Cap at `MAX_LIQ_PER_SWAP`.
@@ -38,7 +41,7 @@ use crate::{
     },
     state::{
         bitmap_clear, bitmap_iter_set_range, is_valid_token_program, Loan, LoanIndexBand,
-        LoanLink, Pool, POOL_SEED,
+        Pool, POOL_SEED,
     },
 };
 
@@ -49,8 +52,6 @@ const FIXED_PREFIX_LEN: usize = 9;
 
 #[derive(Debug)]
 struct LoanCtx {
-    /// Index into the global `accounts` slice for this loan's `LoanLink`.
-    link_idx: usize,
     /// Index into `accounts` for this loan's `Loan`.
     loan_idx: usize,
     /// Trigger price (denormalized for fast comparison).
@@ -71,8 +72,8 @@ struct LoanCtx {
 struct BandCtx {
     /// Index into `accounts` for the band PDA.
     band_idx: usize,
-    /// Indices (into `accounts`) of this band's links, in chain order.
-    link_idxs: Vec<usize>,
+    /// Indices (into `accounts`) of this band's supplied loans.
+    loan_idxs: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -83,7 +84,7 @@ pub fn process_swap(
     min_out: u64,
     a_to_b: bool,
     band_boundary: u32,
-    band_link_counts: Vec<u8>,
+    band_loan_counts: Vec<u8>,
 ) -> ProgramResult {
     if accounts.len() < FIXED_PREFIX_LEN {
         return Err(LiquidityError::InvalidLiquidationContext.into());
@@ -127,9 +128,15 @@ pub fn process_swap(
     }
 
     // ---- Parse the variable tail ----
-    let mut bands: Vec<BandCtx> = Vec::with_capacity(band_link_counts.len());
+    // Layout per band: [Band PDA, Loan × k]. The caller proves it supplied a
+    // band's full membership (DESIGN.md §6.5) by handing over exactly
+    // `band.count` distinct open loans, sorted strictly ascending by pubkey,
+    // each carrying this band's `band_id` and the swap's trigger direction.
+    // `k` distinct members of a band whose true size is `band.count` are, by
+    // pigeonhole, exactly the band — so nothing triggerable can be omitted.
+    let mut bands: Vec<BandCtx> = Vec::with_capacity(band_loan_counts.len());
     let mut loans: Vec<LoanCtx> = Vec::new();
-    let mut supplied_band_ids: Vec<u32> = Vec::with_capacity(band_link_counts.len());
+    let mut supplied_band_ids: Vec<u32> = Vec::with_capacity(band_loan_counts.len());
     let mut cursor = FIXED_PREFIX_LEN;
     // a_to_b = user deposits A, withdraws B → vault A grows, vault B shrinks
     //          → price_b_per_a = accounted_b / accounted_a FALLS
@@ -142,9 +149,9 @@ pub fn process_swap(
     };
     let expected_dir_byte = expected_direction as u8;
 
-    for &k_u8 in band_link_counts.iter() {
+    for &k_u8 in band_loan_counts.iter() {
         let k = k_u8 as usize;
-        let needed = 1 + 2 * k;
+        let needed = 1 + k;
         if cursor + needed > accounts.len() {
             return Err(LiquidityError::InvalidLiquidationContext.into());
         }
@@ -161,49 +168,31 @@ pub fn process_swap(
         {
             return Err(LiquidityError::BandMismatch.into());
         }
+        // No band may be supplied twice — combined with strict ascension within
+        // a band, this makes every supplied loan globally distinct.
+        if supplied_band_ids.contains(&band.band_id) {
+            return Err(LiquidityError::InvalidLiquidationContext.into());
+        }
         if band.count as usize != k {
-            // Caller must supply ALL links in any band on the path.
+            // Caller must supply ALL loans in any band on the path.
             return Err(LiquidityError::IncompleteBandWalk.into());
         }
 
-        let link_start = cursor + 1;
-        let loan_start = link_start + k;
-
-        // Verify chain order: first link == band.head_link;
-        // for i > 0, supplied[i-1].next == supplied[i].pubkey.
-        let mut prev_pubkey = Pubkey::default();
-        let mut link_idxs = Vec::with_capacity(k);
+        let loan_start = cursor + 1;
+        let mut prev_key = Pubkey::default();
+        let mut loan_idxs = Vec::with_capacity(k);
         for i in 0..k {
-            let link_idx = link_start + i;
-            let link_info = &accounts[link_idx];
-            if link_info.owner != program_id {
-                return Err(LiquidityError::InvalidAccountOwner.into());
-            }
-            let link = LoanLink::try_from_slice(&link_info.try_borrow_data()?)
-                .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-            if !link.is_initialized()
-                || link.pool != *pool_info.key
-                || link.direction != expected_dir_byte
-                || link.band_id != band.band_id
-            {
-                return Err(LiquidityError::LinkChainBroken.into());
-            }
-            if i == 0 {
-                if *link_info.key != band.head_link {
-                    return Err(LiquidityError::LinkChainBroken.into());
-                }
-            } else if link.prev != prev_pubkey {
-                return Err(LiquidityError::LinkChainBroken.into());
-            }
-            // Validate that the next loan account corresponds to this link.
             let loan_idx = loan_start + i;
             let loan_info = &accounts[loan_idx];
             if loan_info.owner != program_id {
                 return Err(LiquidityError::InvalidAccountOwner.into());
             }
-            if *loan_info.key != link.loan {
+            // Strict ascension ⇒ supplied loans within this band are distinct.
+            if *loan_info.key <= prev_key {
                 return Err(LiquidityError::InvalidLiquidationContext.into());
             }
+            prev_key = *loan_info.key;
+
             let loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
                 .map_err(|_| LiquidityError::AccountDataTooSmall)?;
             if !loan.is_initialized() || loan.pool != *pool_info.key {
@@ -212,15 +201,15 @@ pub fn process_swap(
             if !loan.is_open() {
                 return Err(LiquidityError::LoanNotOpen.into());
             }
-            let direction = TriggerDirection::from_u8(loan.trigger_direction)?;
-            let sides = LoanSides::from_u8(loan.sides)?;
-            if direction != expected_direction {
-                // Caller supplied a loan irrelevant to this swap direction.
+            // Membership: a loan belongs to this band iff its cached band_id and
+            // trigger direction match. (band_id is immutable after open.)
+            if loan.band_id != band.band_id || loan.trigger_direction != expected_dir_byte {
                 return Err(LiquidityError::InvalidLiquidationContext.into());
             }
-            link_idxs.push(link_idx);
+            let direction = TriggerDirection::from_u8(loan.trigger_direction)?;
+            let sides = LoanSides::from_u8(loan.sides)?;
+            loan_idxs.push(loan_idx);
             loans.push(LoanCtx {
-                link_idx,
                 loan_idx,
                 trigger_wad: loan.trigger_price_wad,
                 direction,
@@ -229,20 +218,9 @@ pub fn process_swap(
                 debt_principal: loan.debt_principal,
                 liquidated: false,
             });
-            prev_pubkey = *link_info.key;
-        }
-        // Verify tail terminates: last supplied link.next == default.
-        if k > 0 {
-            let last_link_info = &accounts[link_start + k - 1];
-            let last_link =
-                LoanLink::try_from_slice(&last_link_info.try_borrow_data()?)
-                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-            if last_link.next != Pubkey::default() {
-                return Err(LiquidityError::IncompleteBandWalk.into());
-            }
         }
         supplied_band_ids.push(band.band_id);
-        bands.push(BandCtx { band_idx, link_idxs });
+        bands.push(BandCtx { band_idx, loan_idxs });
         cursor += needed;
     }
     if cursor != accounts.len() {
@@ -595,16 +573,17 @@ pub fn process_swap(
     Ok(())
 }
 
-/// For each band, walk its supplied links in chain order. Survivors get
-/// rewired with prev/next pointing to the previous/next survivor.
-/// Liquidated links are zeroed (data wiped); their lamports remain
-/// recoverable via a future cleanup instruction. Liquidated loans are
-/// marked `STATUS_LIQUIDATED` with their amounts zeroed.
+/// For each band, tombstone its liquidated loans and decrement the band's
+/// membership `count` accordingly. Liquidated loans are marked
+/// `STATUS_LIQUIDATED` with their amounts zeroed (the tombstone preserves
+/// off-chain auditability; lamports remain recoverable by the borrower via
+/// `ClaimLiquidatedRent`). Survivors need no rewiring — band membership is
+/// just a count, not an ordered chain.
 ///
-/// If a band's link count drops to 0, its bit in the pool's bitmap is
-/// cleared so subsequent swaps don't have to supply it. The band PDA is
-/// left allocated (rent recoverable later) — the bitmap is the source of
-/// truth for "populated".
+/// If a band's `count` drops to 0, its bit in the pool's bitmap is cleared so
+/// subsequent swaps don't have to supply it. The band PDA is left allocated
+/// (rent recoverable later) — the bitmap is the source of truth for
+/// "populated".
 fn persist_liquidations(
     accounts: &[AccountInfo],
     loans: &[LoanCtx],
@@ -620,118 +599,52 @@ fn persist_liquidations(
             LoanIndexBand::try_from_slice(&band_info.try_borrow_data()?)
                 .map_err(|_| LiquidityError::AccountDataTooSmall)?;
 
-        let mut new_head = Pubkey::default();
-        let mut prev_pubkey = Pubkey::default();
-        let mut prev_link_idx_in_accts: Option<usize> = None;
-        let mut new_count: u32 = 0;
-        // Track new min/max trigger across surviving links.
-        let mut new_min_trigger: u128 = u128::MAX;
-        let mut new_max_trigger: u128 = 0;
+        let mut liquidated_here: u32 = 0;
 
-        for &link_idx in band.link_idxs.iter() {
-            // Find this link's entry in `loans` (1:1 with link_idxs in order).
+        for &loan_idx in band.loan_idxs.iter() {
+            // Each supplied loan maps 1:1 to a LoanCtx by its account index.
             let lc = loans
                 .iter()
-                .find(|l| l.link_idx == link_idx)
+                .find(|l| l.loan_idx == loan_idx)
                 .ok_or(LiquidityError::InvalidLiquidationContext)?;
-
-            let link_info = &accounts[link_idx];
-            let loan_info = &accounts[lc.loan_idx];
-
-            if lc.liquidated {
-                // Mark Loan as liquidated with zeroed amounts (preserves the
-                // tombstone for off-chain auditability). Lamports remain in
-                // the account; borrower can reclaim later.
-                let mut loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
-                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-                // Capture pre-zero values for the event.
-                LoanLiquidated {
-                    pool: loan.pool,
-                    loan: *loan_info.key,
-                    borrower: loan.borrower,
-                    sides: lc.sides as u8,
-                    collateral_amount: lc.collateral,
-                    debt_principal: lc.debt_principal,
-                    trigger_price_wad: lc.trigger_wad,
-                }
-                .emit();
-                loan.collateral_amount = 0;
-                loan.debt_principal = 0;
-                loan.status = Loan::STATUS_LIQUIDATED;
-                loan.closed_slot = clock.slot;
-                let mut data = loan_info.try_borrow_mut_data()?;
-                loan.serialize(&mut &mut data[..])?;
-                // Zero the LoanLink data (it's no longer in any chain).
-                let mut data = link_info.try_borrow_mut_data()?;
-                for byte in data.iter_mut() {
-                    *byte = 0;
-                }
+            if !lc.liquidated {
                 continue;
             }
-
-            // Survivor: rewire prev/next.
-            let mut link =
-                LoanLink::try_from_slice(&link_info.try_borrow_data()?)
-                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-            link.prev = prev_pubkey;
-            link.next = Pubkey::default();
-            {
-                let mut data = link_info.try_borrow_mut_data()?;
-                link.serialize(&mut &mut data[..])?;
-            }
-            // Update the previous survivor's `next` to point at us.
-            if let Some(prev_idx) = prev_link_idx_in_accts {
-                let prev_info = &accounts[prev_idx];
-                let mut prev_link = LoanLink::try_from_slice(
-                    &prev_info.try_borrow_data()?,
-                )
+            let loan_info = &accounts[loan_idx];
+            // Mark Loan as liquidated with zeroed amounts. Lamports remain in
+            // the account; borrower can reclaim later via ClaimLiquidatedRent.
+            let mut loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
                 .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-                prev_link.next = *link_info.key;
-                let mut data = prev_info.try_borrow_mut_data()?;
-                prev_link.serialize(&mut &mut data[..])?;
+            // Capture pre-zero values for the event.
+            LoanLiquidated {
+                pool: loan.pool,
+                loan: *loan_info.key,
+                borrower: loan.borrower,
+                sides: lc.sides as u8,
+                collateral_amount: lc.collateral,
+                debt_principal: lc.debt_principal,
+                trigger_price_wad: lc.trigger_wad,
             }
-            if new_count == 0 {
-                new_head = *link_info.key;
-            }
-            new_count += 1;
-            prev_pubkey = *link_info.key;
-            prev_link_idx_in_accts = Some(link_idx);
-            if link.trigger_price_wad < new_min_trigger {
-                new_min_trigger = link.trigger_price_wad;
-            }
-            if link.trigger_price_wad > new_max_trigger {
-                new_max_trigger = link.trigger_price_wad;
-            }
+            .emit();
+            loan.collateral_amount = 0;
+            loan.debt_principal = 0;
+            loan.status = Loan::STATUS_LIQUIDATED;
+            loan.closed_slot = clock.slot;
+            let mut data = loan_info.try_borrow_mut_data()?;
+            loan.serialize(&mut &mut data[..])?;
+            liquidated_here += 1;
         }
 
-        band_state.head_link = new_head;
-        band_state.tail_link = prev_pubkey;
-        let was_populated = band_state.count > 0;
-        band_state.count = new_count;
-        if new_count == 0 {
-            band_state.min_trigger_wad = u128::MAX;
-            band_state.max_trigger_wad = 0;
-            // Maintain bitmap invariant: bit set ↔ band has loans.
-            if was_populated {
-                bitmap_clear(pool.band_bitmap_mut(direction_byte)?, band_state.band_id)?;
-                match TriggerDirection::from_u8(direction_byte)? {
-                    TriggerDirection::OnFall => {
-                        pool.band_count_fall = pool
-                            .band_count_fall
-                            .checked_sub(1)
-                            .ok_or(LiquidityError::MathUnderflow)?;
-                    }
-                    TriggerDirection::OnRise => {
-                        pool.band_count_rise = pool
-                            .band_count_rise
-                            .checked_sub(1)
-                            .ok_or(LiquidityError::MathUnderflow)?;
-                    }
-                }
-            }
-        } else {
-            band_state.min_trigger_wad = new_min_trigger;
-            band_state.max_trigger_wad = new_max_trigger;
+        if liquidated_here == 0 {
+            continue;
+        }
+        band_state.count = band_state
+            .count
+            .checked_sub(liquidated_here)
+            .ok_or(LiquidityError::MathUnderflow)?;
+        // Maintain bitmap invariant: bit set ↔ band has loans.
+        if band_state.count == 0 {
+            bitmap_clear(pool.band_bitmap_mut(direction_byte)?, band_state.band_id)?;
         }
         let mut data = band_info.try_borrow_mut_data()?;
         band_state.serialize(&mut &mut data[..])?;

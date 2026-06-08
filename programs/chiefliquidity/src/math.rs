@@ -296,7 +296,7 @@ impl LoanSides {
 /// Direction in which the pool's price (B-per-A) must move for a loan to
 /// become liquidatable.
 ///
-/// Stored as `u8` on the `Loan` and `LoanLink` accounts.
+/// Stored as `u8` (`trigger_direction`) on the `Loan` account.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerDirection {

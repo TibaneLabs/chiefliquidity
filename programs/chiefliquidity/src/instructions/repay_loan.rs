@@ -1,11 +1,11 @@
 //! Repay a loan in full and release collateral.
 //!
-//! Computes interest accrued since `last_accrual_slot`, transfers
-//! `principal + accrued` of the debt token from the borrower into the vault,
-//! transfers `collateral_amount` of the collateral token from the vault back
-//! to the borrower, unlinks the `LoanLink` from its band's chain, marks the
-//! `Loan` as repaid, and refunds the rent of `Loan` and `LoanLink` (and
-//! `Band` if it became empty) to the borrower.
+//! Computes interest accrued via the borrow index, transfers `principal +
+//! accrued` of the debt token from the borrower into the vault, transfers
+//! `collateral_amount` of the collateral token from the vault back to the
+//! borrower, decrements the loan's band membership `count` (clearing the Pool
+//! band bitmap bit and refunding the band's rent if it became empty), marks the
+//! `Loan` as repaid, and refunds the `Loan` rent to the borrower.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -25,10 +25,9 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     events::{Event, LoanRepaid},
-    math::{LoanSides, TriggerDirection},
+    math::LoanSides,
     state::{
-        bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
-        POOL_SEED,
+        bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, Pool, POOL_SEED,
     },
 };
 
@@ -47,10 +46,7 @@ pub fn process_repay_loan(
     let mint_b_info = next_account_info(it)?;
     let borrower_info = next_account_info(it)?;
     let loan_info = next_account_info(it)?;
-    let loan_link_info = next_account_info(it)?;
     let band_info = next_account_info(it)?;
-    let prev_link_info = next_account_info(it)?;
-    let next_link_info = next_account_info(it)?;
     let token_program_info = next_account_info(it)?;
 
     if !borrower_info.is_signer {
@@ -61,7 +57,6 @@ pub fn process_repay_loan(
     }
     if pool_info.owner != program_id
         || loan_info.owner != program_id
-        || loan_link_info.owner != program_id
         || band_info.owner != program_id
     {
         return Err(LiquidityError::InvalidAccountOwner.into());
@@ -96,22 +91,7 @@ pub fn process_repay_loan(
         return Err(LiquidityError::InvalidPool.into());
     }
 
-    let link = {
-        let data = loan_link_info.try_borrow_data()?;
-        LoanLink::try_from_slice(&data)
-            .map_err(|_| LiquidityError::AccountDataTooSmall)?
-    };
-    if !link.is_initialized() {
-        return Err(LiquidityError::NotInitialized.into());
-    }
-    if link.pool != *pool_info.key || link.loan != *loan_info.key {
-        return Err(LiquidityError::InvalidPool.into());
-    }
-    let (expected_link, _) = LoanLink::derive_pda(pool_info.key, loan_info.key, program_id);
-    if expected_link != *loan_link_info.key {
-        return Err(LiquidityError::InvalidPDA.into());
-    }
-
+    // The loan's cached band_id + trigger_direction identify its band PDA.
     let mut band = {
         let data = band_info.try_borrow_data()?;
         LoanIndexBand::try_from_slice(&data)
@@ -119,10 +99,19 @@ pub fn process_repay_loan(
     };
     if !band.is_initialized()
         || band.pool != *pool_info.key
-        || band.band_id != link.band_id
-        || band.direction != link.direction
+        || band.band_id != loan.band_id
+        || band.direction != loan.trigger_direction
     {
         return Err(LiquidityError::BandMismatch.into());
+    }
+    let (expected_band, _) = LoanIndexBand::derive_pda(
+        pool_info.key,
+        loan.trigger_direction,
+        loan.band_id,
+        program_id,
+    );
+    if expected_band != *band_info.key {
+        return Err(LiquidityError::InvalidPDA.into());
     }
 
     let clock = Clock::get()?;
@@ -257,44 +246,7 @@ pub fn process_repay_loan(
         .ok_or(LiquidityError::MathUnderflow)?;
     pool.last_update_slot = clock.slot;
 
-    // ---- Unlink LoanLink from band ----
-    let is_at_head = link.prev == Pubkey::default();
-    let is_at_tail = link.next == Pubkey::default();
-
-    // Update prev_link.next = link.next (if there is a prev)
-    if !is_at_head {
-        if *prev_link_info.key != link.prev {
-            return Err(LiquidityError::LinkChainBroken.into());
-        }
-        let mut prev = {
-            let data = prev_link_info.try_borrow_data()?;
-            LoanLink::try_from_slice(&data)
-                .map_err(|_| LiquidityError::AccountDataTooSmall)?
-        };
-        prev.next = link.next;
-        let mut data = prev_link_info.try_borrow_mut_data()?;
-        prev.serialize(&mut &mut data[..])?;
-    }
-    // Update next_link.prev = link.prev (if there is a next)
-    if !is_at_tail {
-        if *next_link_info.key != link.next {
-            return Err(LiquidityError::LinkChainBroken.into());
-        }
-        let mut next = {
-            let data = next_link_info.try_borrow_data()?;
-            LoanLink::try_from_slice(&data)
-                .map_err(|_| LiquidityError::AccountDataTooSmall)?
-        };
-        next.prev = link.prev;
-        let mut data = next_link_info.try_borrow_mut_data()?;
-        next.serialize(&mut &mut data[..])?;
-    }
-    if is_at_head {
-        band.head_link = link.next;
-    }
-    if is_at_tail {
-        band.tail_link = link.prev;
-    }
+    // ---- Drop this loan from its band's membership ----
     band.count = band
         .count
         .checked_sub(1)
@@ -305,24 +257,8 @@ pub fn process_repay_loan(
         let mut data = band_info.try_borrow_mut_data()?;
         band.serialize(&mut &mut data[..])?;
     } else {
-        // Band is empty — refund its rent to the borrower and zero its data.
-        // Pool-level band counter and presence bitmap go down too.
-        let dir_byte = band.direction;
-        match TriggerDirection::from_u8(dir_byte)? {
-            TriggerDirection::OnFall => {
-                pool.band_count_fall = pool
-                    .band_count_fall
-                    .checked_sub(1)
-                    .ok_or(LiquidityError::MathUnderflow)?;
-            }
-            TriggerDirection::OnRise => {
-                pool.band_count_rise = pool
-                    .band_count_rise
-                    .checked_sub(1)
-                    .ok_or(LiquidityError::MathUnderflow)?;
-            }
-        }
-        bitmap_clear(pool.band_bitmap_mut(dir_byte)?, band.band_id)?;
+        // Band is empty — clear its presence bit and refund its rent.
+        bitmap_clear(pool.band_bitmap_mut(band.direction)?, band.band_id)?;
         close_account(band_info, borrower_info)?;
     }
 
@@ -336,8 +272,6 @@ pub fn process_repay_loan(
         let mut data = loan_info.try_borrow_mut_data()?;
         loan.serialize(&mut &mut data[..])?;
     }
-    let _ = link; // link's storage about to be reclaimed
-    close_account(loan_link_info, borrower_info)?;
     close_account(loan_info, borrower_info)?;
 
     {

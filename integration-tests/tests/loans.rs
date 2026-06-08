@@ -104,7 +104,6 @@ async fn open_loan_zero_amount() {
 
     let (borrower, ata_a, ata_b, _) = env.setup_user(10_000_000_000, 100_000_000, 0).await;
     let (loan_pda, _) = env.loan_pda(&borrower.pubkey(), 0);
-    let (link_pda, _) = env.loan_link_pda(&loan_pda);
     // band_id = 0 (any value works since the program rejects before computing)
     let (band_pda, _) = env.band_pda(0, 0);
 
@@ -126,9 +125,7 @@ async fn open_loan_zero_amount() {
             solana_program::instruction::AccountMeta::new_readonly(env.mint_b.pubkey(), false),
             solana_program::instruction::AccountMeta::new(borrower.pubkey(), true),
             solana_program::instruction::AccountMeta::new(loan_pda, false),
-            solana_program::instruction::AccountMeta::new(link_pda, false),
             solana_program::instruction::AccountMeta::new(band_pda, false),
-            solana_program::instruction::AccountMeta::new(link_pda, false),
             solana_program::instruction::AccountMeta::new_readonly(
                 solana_program::system_program::id(),
                 false,
@@ -206,7 +203,7 @@ async fn repay_loan_full_round_trip() {
     assert_eq!(pool.total_debt_b, 0);
     assert_eq!(pool.total_collateral_a, 0);
 
-    // Loan + LoanLink + Band accounts are closed (rent refunded).
+    // Loan + Band accounts are closed (rent refunded).
     let (loan_pda, _) = env.loan_pda(&borrower.pubkey(), nonce);
     assert!(env.loan_state(&loan_pda).await.is_none());
 }
@@ -228,9 +225,8 @@ async fn repay_loan_wrong_borrower_rejected() {
         env.setup_user(10_000_000_000, 0, 1_000_000_000).await;
     // Build using Alice's nonce; bob signs.
     let (alice_loan_pda, _) = env.loan_pda(&alice.pubkey(), nonce);
-    let (alice_link_pda, _) = env.loan_link_pda(&alice_loan_pda);
-    let link = env.loan_link_state(&alice_link_pda).await.unwrap();
-    let (band_pda, _) = env.band_pda(link.direction, link.band_id);
+    let alice_loan = env.loan_state(&alice_loan_pda).await.unwrap();
+    let (band_pda, _) = env.band_pda(alice_loan.trigger_direction, alice_loan.band_id);
 
     let data = chiefliquidity::LiquidityInstruction::RepayLoan;
     let ix = solana_program::instruction::Instruction {
@@ -245,10 +241,7 @@ async fn repay_loan_wrong_borrower_rejected() {
             solana_program::instruction::AccountMeta::new_readonly(env.mint_b.pubkey(), false),
             solana_program::instruction::AccountMeta::new(bob.pubkey(), true),
             solana_program::instruction::AccountMeta::new(alice_loan_pda, false),
-            solana_program::instruction::AccountMeta::new(alice_link_pda, false),
             solana_program::instruction::AccountMeta::new(band_pda, false),
-            solana_program::instruction::AccountMeta::new(alice_link_pda, false),
-            solana_program::instruction::AccountMeta::new(alice_link_pda, false),
             solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
         ],
         data: borsh::to_vec(&data).unwrap(),
@@ -264,7 +257,7 @@ async fn repay_loan_wrong_borrower_rejected() {
 }
 
 #[tokio::test]
-async fn loan_and_link_closed_after_repay() {
+async fn loan_closed_after_repay() {
     let mut env = TestEnv::new().await;
     let _ = env.setup_pool_with_liquidity(1_000_000_000, 4_000_000_000).await;
 
@@ -280,14 +273,9 @@ async fn loan_and_link_closed_after_repay() {
         .unwrap();
 
     let (loan_pda, _) = env.loan_pda(&borrower.pubkey(), nonce);
-    let (link_pda, _) = env.loan_link_pda(&loan_pda);
     assert!(
         env.loan_state(&loan_pda).await.is_none(),
         "loan account should be closed"
-    );
-    assert!(
-        env.loan_link_state(&link_pda).await.is_none(),
-        "loan_link account should be closed"
     );
 }
 

@@ -5,7 +5,7 @@ mod common;
 use chiefliquidity::{
     error::LiquidityError,
     math::WAD,
-    state::{Pool, POOL_DISCRIMINATOR},
+    state::POOL_DISCRIMINATOR,
     LiquidityInstruction,
 };
 use common::{err_code, extract_custom_error, PoolParams, TestEnv};

@@ -104,8 +104,9 @@ pub enum LiquidityInstruction {
     /// Open a collateralized loan. Caller specifies the side (which token is
     /// collateral, which is debt), the amounts, and the loan nonce (which
     /// must equal `pool.next_loan_nonce`). Program computes the trigger
-    /// price and band id from the supplied amounts and `liq_ratio_bps`, and
-    /// inserts a new `LoanLink` at the tail of the band's intra-band chain.
+    /// price and band id from the supplied amounts and `liq_ratio_bps`,
+    /// allocates the `LoanIndexBand` on first use, and increments its
+    /// membership `count`.
     ///
     /// LTV check: debt_value / collateral_value ≤ `pool.max_ltv_bps`, with
     /// values converted via the pool's accounted mid-price.
@@ -120,12 +121,9 @@ pub enum LiquidityInstruction {
     /// 6. `[]`         Mint B
     /// 7. `[writable, signer]` Borrower (also the rent payer for new accounts)
     /// 8. `[writable]` Loan PDA — `["loan", pool, borrower, nonce_le]`
-    /// 9. `[writable]` LoanLink PDA — `["loan_link", pool, loan]`
-    /// 10. `[writable]` Band PDA — `["band", pool, direction, band_id_le]`
-    /// 11. `[writable]` Old tail link PDA (= band.tail). If band is empty,
-    ///                  pass the new LoanLink account as a placeholder.
-    /// 12. `[]`        System program
-    /// 13. `[]`        Token program
+    /// 9. `[writable]` Band PDA — `["band", pool, direction, band_id_le]`
+    /// 10. `[]`        System program
+    /// 11. `[]`        Token program
     OpenLoan {
         sides: u8,
         collateral_amount: u64,
@@ -135,8 +133,9 @@ pub enum LiquidityInstruction {
 
     /// Repay a loan in full (no partial repay in v1). Transfers the
     /// principal-plus-accrued debt back into the pool, releases the
-    /// collateral to the borrower, unlinks the `LoanLink` from its band,
-    /// and marks the `Loan` as repaid.
+    /// collateral to the borrower, decrements the band's membership `count`
+    /// (refunding the band's rent if it empties), and marks the `Loan` as
+    /// repaid.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
@@ -148,28 +147,23 @@ pub enum LiquidityInstruction {
     /// 6. `[]`         Mint B
     /// 7. `[writable, signer]` Borrower
     /// 8. `[writable]` Loan
-    /// 9. `[writable]` LoanLink
-    /// 10. `[writable]` Band
-    /// 11. `[writable]` Prev link (= loan_link.prev). If loan is at head, pass
-    ///                  the loan_link itself as a placeholder.
-    /// 12. `[writable]` Next link (= loan_link.next). If loan is at tail, pass
-    ///                  the loan_link itself as a placeholder.
-    /// 13. `[]`        Token program
+    /// 9. `[writable]` Band
+    /// 10. `[]`        Token program
     RepayLoan,
 
     /// Swap with mandatory in-flight liquidation. See DESIGN.md §7.
     ///
-    /// Caller supplies all bands+links+loans whose liquidation might be
-    /// triggered by the price move. The program iteratively (a) computes the
-    /// post-swap price, (b) finds the next supplied loan whose direction
-    /// matches and whose trigger has been crossed, (c) liquidates it, and
-    /// (d) recomputes. After the loop terminates, the swap is quoted on the
-    /// final accounted reserves and committed only if it satisfies the
-    /// user's `min_out` and the pool's executable cap.
+    /// Caller supplies all bands+loans whose liquidation might be triggered by
+    /// the price move. The program iteratively (a) computes the post-swap
+    /// price, (b) finds the next supplied loan whose direction matches and
+    /// whose trigger has been crossed, (c) liquidates it, and (d) recomputes.
+    /// After the loop terminates, the swap is quoted on the final accounted
+    /// reserves and committed only if it satisfies the user's `min_out` and the
+    /// pool's executable cap.
     ///
-    /// `band_link_counts[i]` = number of links (and loans) supplied for the
-    /// `i`-th band. The total tail account count is
-    /// `Σ (1 + 2 * band_link_counts[i])`.
+    /// `band_loan_counts[i]` = number of loans supplied for the `i`-th band
+    /// (must equal that band's `count`). The total tail account count is
+    /// `Σ (1 + band_loan_counts[i])`.
     ///
     /// Accounts (fixed prefix):
     /// 0. `[writable]` Pool
@@ -182,11 +176,10 @@ pub enum LiquidityInstruction {
     /// 7. `[signer]`   User
     /// 8. `[]`         Token program
     ///
-    /// Accounts (per band, repeated for each entry in `band_link_counts`):
+    /// Accounts (per band, repeated for each entry in `band_loan_counts`):
     ///   `[writable]` Band PDA
-    ///   `[writable]` LoanLink × K (in chain order: from band.head_link
-    ///                forward via .next pointers)
-    ///   `[writable]` Loan × K (matching the LoanLinks above)
+    ///   `[writable]` Loan × K (all of the band's open loans, sorted strictly
+    ///                ascending by pubkey)
     /// Authority-only: drain accumulated protocol fees from the vaults to
     /// the authority's token accounts. Resets `protocol_fees_a` and
     /// `protocol_fees_b` to 0. No-op if both are already 0.
@@ -213,13 +206,12 @@ pub enum LiquidityInstruction {
     /// 1. `[signer]`   Current authority
     TransferAuthority { new_authority: Pubkey },
 
-    /// Borrower-callable: reclaim the rent on a `Loan` (and its tombstoned
-    /// `LoanLink`) that was liquidated mid-swap.
+    /// Borrower-callable: reclaim the rent on a `Loan` that was liquidated
+    /// mid-swap.
     ///
     /// Accounts:
     /// 0. `[writable]` Loan (status=LIQUIDATED, drained + zeroed)
-    /// 1. `[writable]` LoanLink (drained; data already zero from swap)
-    /// 2. `[writable, signer]` Borrower (lamport recipient; must match
+    /// 1. `[writable, signer]` Borrower (lamport recipient; must match
     ///                  `Loan.borrower`)
     ClaimLiquidatedRent,
 
@@ -259,7 +251,7 @@ pub enum LiquidityInstruction {
         ///   price's band id is `≤ band_boundary`. Program verifies the
         ///   analogous condition against `band_bitmap_rise`.
         band_boundary: u32,
-        band_link_counts: Vec<u8>,
+        band_loan_counts: Vec<u8>,
     },
 }
 
@@ -405,7 +397,7 @@ pub fn process_instruction(
             min_out,
             a_to_b,
             band_boundary,
-            band_link_counts,
+            band_loan_counts,
         } => {
             msg!("Instruction: Swap");
             process_swap(
@@ -415,7 +407,7 @@ pub fn process_instruction(
                 min_out,
                 a_to_b,
                 band_boundary,
-                band_link_counts,
+                band_loan_counts,
             )
         }
     }

@@ -1,9 +1,9 @@
 //! Open a collateralized loan against the pool.
 //!
-//! Creates a `Loan` and `LoanLink`; allocates the corresponding `LoanIndexBand`
-//! on first use; appends the new link to the tail of the band's intra-band
-//! chain. Updates `pool.total_debt_x`, `pool.total_collateral_y`,
-//! `pool.open_loans`, `pool.next_loan_nonce`.
+//! Creates a `Loan` and allocates the corresponding `LoanIndexBand` on first
+//! use, incrementing its membership `count` (and setting the Pool band bitmap
+//! when the band goes from empty to populated). Updates `pool.total_debt_x`,
+//! `pool.total_collateral_y`, `pool.open_loans`, `pool.next_loan_nonce`.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -25,14 +25,10 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     events::{Event, LoanOpened},
-    math::{
-        band_id_for_trigger, mul_div, recompute_trigger, LoanSides, TriggerDirection,
-        BPS_DENOM,
-    },
+    math::{band_id_for_trigger, mul_div, recompute_trigger, LoanSides, BPS_DENOM},
     state::{
-        bitmap_set, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
-        BAND_SEED, LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR,
-        LOAN_LINK_DISCRIMINATOR, LOAN_LINK_SEED, LOAN_SEED, POOL_SEED,
+        bitmap_set, is_valid_token_program, Loan, LoanIndexBand, Pool, BAND_SEED,
+        LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR, LOAN_SEED, POOL_SEED,
     },
 };
 
@@ -56,9 +52,7 @@ pub fn process_open_loan(
     let mint_b_info = next_account_info(it)?;
     let borrower_info = next_account_info(it)?;
     let loan_info = next_account_info(it)?;
-    let loan_link_info = next_account_info(it)?;
     let band_info = next_account_info(it)?;
-    let old_tail_info = next_account_info(it)?;
     let system_program_info = next_account_info(it)?;
     let token_program_info = next_account_info(it)?;
 
@@ -155,11 +149,6 @@ pub fn process_open_loan(
     if *loan_info.key != expected_loan {
         return Err(LiquidityError::InvalidPDA.into());
     }
-    let (expected_link, link_bump) =
-        LoanLink::derive_pda(pool_info.key, loan_info.key, program_id);
-    if *loan_link_info.key != expected_link {
-        return Err(LiquidityError::InvalidPDA.into());
-    }
     let band_id = band_id_for_trigger(trigger_price_wad)?;
     let direction_byte = direction as u8;
     let (expected_band, band_bump) =
@@ -168,9 +157,6 @@ pub fn process_open_loan(
         return Err(LiquidityError::BandMismatch.into());
     }
     if !loan_info.data_is_empty() {
-        return Err(LiquidityError::AlreadyInitialized.into());
-    }
-    if !loan_link_info.data_is_empty() {
         return Err(LiquidityError::AlreadyInitialized.into());
     }
 
@@ -202,29 +188,6 @@ pub fn process_open_loan(
         &[loan_seeds],
     )?;
 
-    // ---- Allocate LoanLink ----
-    let link_seeds: &[&[u8]] = &[
-        LOAN_LINK_SEED,
-        pool_info.key.as_ref(),
-        loan_info.key.as_ref(),
-        std::slice::from_ref(&link_bump),
-    ];
-    invoke_signed(
-        &system_instruction::create_account(
-            borrower_info.key,
-            loan_link_info.key,
-            rent.minimum_balance(LoanLink::LEN),
-            LoanLink::LEN as u64,
-            program_id,
-        ),
-        &[
-            borrower_info.clone(),
-            loan_link_info.clone(),
-            system_program_info.clone(),
-        ],
-        &[link_seeds],
-    )?;
-
     // ---- Allocate Band on first use ----
     let band_id_le = band_id.to_le_bytes();
     let band_seeds: &[&[u8]] = &[
@@ -234,7 +197,6 @@ pub fn process_open_loan(
         &band_id_le,
         std::slice::from_ref(&band_bump),
     ];
-    let band_was_empty;
     if band_info.data_is_empty() {
         invoke_signed(
             &system_instruction::create_account(
@@ -258,38 +220,17 @@ pub fn process_open_loan(
             direction: direction_byte,
             bump: band_bump,
             _pad: [0; 2],
-            head_link: Pubkey::default(),
-            tail_link: Pubkey::default(),
             count: 0,
             _pad2: [0; 4],
-            min_trigger_wad: u128::MAX,
-            max_trigger_wad: 0,
             _reserved: [0; 32],
         };
         let mut data = band_info.try_borrow_mut_data()?;
         new_band.serialize(&mut &mut data[..])?;
-        band_was_empty = true;
-        // Pool-level band counter + presence bitmap
-        match direction {
-            TriggerDirection::OnFall => {
-                pool.band_count_fall = pool
-                    .band_count_fall
-                    .checked_add(1)
-                    .ok_or(LiquidityError::MathOverflow)?
-            }
-            TriggerDirection::OnRise => {
-                pool.band_count_rise = pool
-                    .band_count_rise
-                    .checked_add(1)
-                    .ok_or(LiquidityError::MathOverflow)?
-            }
-        }
+        // Band goes from empty → populated: set its presence bit.
         bitmap_set(pool.band_bitmap_mut(direction_byte)?, band_id)?;
-    } else {
-        band_was_empty = false;
     }
 
-    // Load (and potentially update) band
+    // Load (and update) band
     let mut band = {
         let data = band_info.try_borrow_data()?;
         LoanIndexBand::try_from_slice(&data)
@@ -302,28 +243,8 @@ pub fn process_open_loan(
     {
         return Err(LiquidityError::BandMismatch.into());
     }
-    if band.count >= LoanIndexBand::MAX_LINKS {
+    if band.count >= LoanIndexBand::MAX_LOANS {
         return Err(LiquidityError::BandFull.into());
-    }
-
-    // ---- Wire the new link into the band's tail ----
-    let prev_pubkey = band.tail_link;
-    if !band_was_empty {
-        if *old_tail_info.key != band.tail_link {
-            return Err(LiquidityError::LinkChainBroken.into());
-        }
-        // Update old tail's `next` to point at the new link.
-        let mut old_tail = {
-            let data = old_tail_info.try_borrow_data()?;
-            LoanLink::try_from_slice(&data)
-                .map_err(|_| LiquidityError::AccountDataTooSmall)?
-        };
-        if !old_tail.is_initialized() {
-            return Err(LiquidityError::NotInitialized.into());
-        }
-        old_tail.next = *loan_link_info.key;
-        let mut data = old_tail_info.try_borrow_mut_data()?;
-        old_tail.serialize(&mut &mut data[..])?;
     }
 
     // ---- Persist Loan ----
@@ -345,49 +266,21 @@ pub fn process_open_loan(
         trigger_direction: direction_byte,
         status: Loan::STATUS_OPEN,
         _status_pad: [0; 6],
+        band_id,
         opened_slot: clock.slot,
         closed_slot: 0,
-        _reserved: [0; 32],
+        _reserved: [0; 28],
     };
     {
         let mut data = loan_info.try_borrow_mut_data()?;
         loan.serialize(&mut &mut data[..])?;
     }
 
-    // ---- Persist LoanLink ----
-    let link = LoanLink {
-        discriminator: LOAN_LINK_DISCRIMINATOR,
-        pool: *pool_info.key,
-        loan: *loan_info.key,
-        band_id,
-        direction: direction_byte,
-        bump: link_bump,
-        _pad: [0; 2],
-        prev: prev_pubkey,
-        next: Pubkey::default(),
-        trigger_price_wad,
-        _reserved: [0; 16],
-    };
-    {
-        let mut data = loan_link_info.try_borrow_mut_data()?;
-        link.serialize(&mut &mut data[..])?;
-    }
-
-    // ---- Update Band ----
-    if band_was_empty {
-        band.head_link = *loan_link_info.key;
-    }
-    band.tail_link = *loan_link_info.key;
+    // ---- Update Band: one more member ----
     band.count = band
         .count
         .checked_add(1)
         .ok_or(LiquidityError::MathOverflow)?;
-    if trigger_price_wad < band.min_trigger_wad {
-        band.min_trigger_wad = trigger_price_wad;
-    }
-    if trigger_price_wad > band.max_trigger_wad {
-        band.max_trigger_wad = trigger_price_wad;
-    }
     {
         let mut data = band_info.try_borrow_mut_data()?;
         band.serialize(&mut &mut data[..])?;

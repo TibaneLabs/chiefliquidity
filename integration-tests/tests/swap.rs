@@ -201,9 +201,8 @@ async fn liquidated_borrower_can_claim_rent() {
         .await
         .unwrap();
 
-    // Pre-claim: loan + link both have lamports.
+    // Pre-claim: the tombstoned loan still holds its rent lamports.
     let (loan_pda, _) = env.loan_pda(&borrower.pubkey(), nonce);
-    let (link_pda, _) = env.loan_link_pda(&loan_pda);
     let pre_loan_lamports = env
         .banks_client
         .get_account(loan_pda)
@@ -211,15 +210,7 @@ async fn liquidated_borrower_can_claim_rent() {
         .unwrap()
         .unwrap()
         .lamports;
-    let pre_link_lamports = env
-        .banks_client
-        .get_account(link_pda)
-        .await
-        .unwrap()
-        .unwrap()
-        .lamports;
     assert!(pre_loan_lamports > 0);
-    assert!(pre_link_lamports > 0);
 
     let pre_borrower_lamports = env
         .banks_client
@@ -240,7 +231,7 @@ async fn liquidated_borrower_can_claim_rent() {
         .unwrap()
         .lamports;
     let recovered = post_borrower_lamports - pre_borrower_lamports;
-    let total = pre_loan_lamports + pre_link_lamports;
+    let total = pre_loan_lamports;
     // Expect >90% recovered (subtract small tx fee).
     assert!(
         recovered as f64 > total as f64 * 0.9,

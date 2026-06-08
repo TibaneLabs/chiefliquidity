@@ -106,14 +106,13 @@ PDAs (seed conventions match `../chiefstaker` — `pub const FOO_SEED: &[u8] = b
 
 | Account            | Seeds                                            | Purpose |
 |--------------------|--------------------------------------------------|---------|
-| `Pool`             | `["pool", mint_a, mint_b]` (mints sorted)        | Per-pair config + reserve totals + index heads |
+| `Pool`             | `["pool", mint_a, mint_b]` (mints sorted)        | Per-pair config + reserve totals + band bitmaps |
 | `Vault A`          | `["vault_a", pool]`                              | SPL token A holdings (real_a) |
 | `Vault B`          | `["vault_b", pool]`                              | SPL token B holdings (real_b) |
 | `LpMint`           | `["lp_mint", pool]`                              | LP share mint |
-| `Loan`             | `["loan", pool, borrower, nonce]`                | Per-position loan state |
-| `LoanLink`         | `["loan_link", pool, loan]`                      | Sorted-list link node (see §6) |
-| `LoanIndexBand`    | `["band", pool, direction, band_id]`             | Bucket head pointer + count (see §6) |
-| `PoolMetadata`     | `["metadata", pool]`                             | Display name/url, optional |
+| `Loan`             | `["loan", pool, borrower, nonce]`                | Per-position loan state (carries its band_id) |
+| `LoanIndexBand`    | `["band", pool, direction, band_id]`             | Per-band membership count (see §6) |
+| `PoolMetadata`     | `["metadata", pool]`                             | Display name/url, optional (not implemented) |
 
 Mints sorted lexicographically so `(A, B)` and `(B, A)` produce the same pool.
 
@@ -172,12 +171,6 @@ pub struct Pool {
     pub borrow_index_b_wad: u128,        // 16
     pub last_index_update_slot: u64,     // 8    slot both indexes last bumped
 
-    // Loan-ordering index heads (see §6)
-    pub head_fall: Pubkey,               // 32   Loan PDA at head of TriggerOnFall list
-    pub head_rise: Pubkey,               // 32   Loan PDA at head of TriggerOnRise list
-    pub band_count_fall: u32,            // 4    populated OnFall bands (debug/telemetry)
-    pub band_count_rise: u32,            // 4    populated OnRise bands
-
     // Counters
     pub open_loans: u64,                 // 8
     pub next_loan_nonce: u64,            // 8    pool-monotonic; see §5.3
@@ -187,7 +180,7 @@ pub struct Pool {
     pub protocol_fees_a: u64,            // 8    skimmed; redeemable by authority
     pub protocol_fees_b: u64,            // 8
 
-    // Band-presence bitmaps (see §6.5). Bit i set ↔ a LoanIndexBand PDA exists
+    // Band-presence bitmaps (see §6). Bit i set ↔ a LoanIndexBand PDA exists
     // for (pool, direction, band_id=i) with count > 0. 16 bytes = 128 bits;
     // band ids ≥ 128 (MAX_BAND_ID = 127) are not representable.
     pub band_bitmap_fall: [u8; 16],      // 16
@@ -198,20 +191,23 @@ pub struct Pool {
 ```
 
 `LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×2 + 2) + 2×4 + (16×2 + 8)
-+ (32×2 + 4×2) + 8×3 + 8×2 + 16×2 + 32
-= 8 + 192 + 4 + 64 + 8 + 6 + 8 + 40 + 72 + 24 + 16 + 32 + 32 = **506 bytes**
++ 8×3 + 8×2 + 16×2 + 32
+= 8 + 192 + 4 + 64 + 8 + 6 + 8 + 40 + 24 + 16 + 32 + 32 = **434 bytes**
 (verified by `state::tests::pool_size` borsh roundtrip).
 
 Notes:
 - `authority` is renounceable by setting to `Pubkey::default()`, same convention as
   `StakingPool`.
-- All `Pubkey` head pointers default to `Pubkey::default()` for an empty list.
 - The interest model started as a flat APR (one `interest_rate_bps_per_year`
   field); it now stores the four-parameter utilization-kink curve plus the two
   per-side borrow indexes that capitalize accrued interest lazily — see §8.
 - `band_bitmap_*` are the on-chain source of truth for "which bands are
   populated", letting a swap prove it supplied every band a price move could
-  cross without an off-chain `getProgramAccounts` walk — see §6.5.
+  cross without an off-chain `getProgramAccounts` walk — see §6.
+- The Pool carries no loan-list head pointers or band counters: the bitmaps say
+  which bands exist, and each `LoanIndexBand` carries its own membership count
+  (§5.3). (The original `head_fall`/`head_rise`/`band_count_*` fields were
+  removed when the linked-list index was retired — see §6.)
 - Reserved bytes mirror chiefstaker's pattern of leaving room for new fields with
   `unwrap_or(0)` deserialize.
 
@@ -248,58 +244,33 @@ pub struct Loan {
     pub status: u8,                      // 1    0 = open, 1 = closed-by-repay, 2 = liquidated
     pub _status_pad: [u8; 6],            // 6
 
+    // Band bucket = band_id_for_trigger(trigger_price_wad). Set once at open;
+    // immutable (trigger_price never changes). Cached so a swap's completeness
+    // proof and off-chain band enumeration don't recompute it. (See §6.)
+    pub band_id: u32,                    // 4
+
     // Lifecycle
     pub opened_slot: u64,                // 8
     pub closed_slot: u64,                // 8
 
-    pub _reserved: [u8; 32],             // 32
+    pub _reserved: [u8; 28],             // 28
 }
 ```
 
-`LEN` = 8 + 32×2 + 8 + 1 + 1 + 16×3 + 8 + 16 + 1 + (1 + 6) + 8×2 + 32
-= 8 + 64 + 8 + 1 + 1 + 48 + 8 + 16 + 1 + 7 + 16 + 32 = **210 bytes** (verified by
+`LEN` = 8 + 32×2 + 8 + 1 + 1 + 16×3 + 8 + 16 + 1 + (1 + 6) + 4 + 8×2 + 28
+= 8 + 64 + 8 + 1 + 1 + 48 + 8 + 16 + 1 + 7 + 4 + 16 + 28 = **210 bytes** (verified by
 `state::tests::loan_size`).
 
-The on-chain index lives in a **separate** `LoanLink` PDA so we can rewire the
-sorted list without touching the loan account (which carries the bump and is
-referenced from the borrower's UI). Splitting also lets us realloc the link layout
-later without breaking loan deserialization.
+There is **no separate per-loan index account**. A loan's membership in its band
+is established entirely by its cached `band_id` + `trigger_direction`; the band
+account (§5.3) only stores a count. (The earlier `LoanLink` doubly-linked-list
+node was removed — see §6.)
 
-### 5.3 `LoanLink`
+### 5.3 `LoanIndexBand`
 
-Doubly-linked list node, one per open loan. Keyed at `["loan_link", pool, loan]`.
-
-```rust
-pub struct LoanLink {
-    pub discriminator: [u8; 8],
-
-    pub pool: Pubkey,                    // 32
-    pub loan: Pubkey,                    // 32   back-reference
-
-    pub band_id: u32,                    // 4    bucket id (see §6)
-    pub direction: u8,                   // 1    matches Loan.trigger_direction
-    pub bump: u8,                        // 1
-    pub _pad: [u8; 2],                   // 2
-
-    pub prev: Pubkey,                    // 32   prev LoanLink in band's intra-band list (or default = head)
-    pub next: Pubkey,                    // 32   next LoanLink (or default = tail)
-    pub trigger_price_wad: u128,         // 16   denormalized for skip-list ordering checks
-
-    pub _reserved: [u8; 16],             // 16
-}
-```
-
-`LEN` = 8 + 32 + 32 + 4 + 1 + 1 + 2 + 32 + 32 + 16 + 16 = **176 bytes**.
-
-`prev`/`next` point to **other LoanLink PDAs** (not Loan PDAs), so traversal only
-requires the link accounts plus the loan accounts that get mutated. A pure
-"read-only walk to find the next trigger" needs only links.
-
-### 5.4 `LoanIndexBand`
-
-One per `(pool, direction, band_id)` tuple. The pool-level `head_fall` /
-`head_rise` point at the head Loan; bands let us skip whole price regions when
-walking to find the next-triggered loan.
+One per `(pool, direction, band_id)` tuple that holds at least one open loan.
+Stores **only a membership count** — not a list of members. PDA:
+`["band", pool, direction_byte, band_id_le_bytes]`.
 
 ```rust
 pub struct LoanIndexBand {
@@ -311,19 +282,20 @@ pub struct LoanIndexBand {
     pub bump: u8,                        // 1
     pub _pad: [u8; 2],                   // 2
 
-    pub head_link: Pubkey,               // 32   first LoanLink in band (default = empty)
-    pub tail_link: Pubkey,               // 32   last LoanLink in band
-    pub count: u32,                      // 4    # of links in this band
+    pub count: u32,                      // 4    # of open loans in this band
     pub _pad2: [u8; 4],                  // 4
-
-    pub min_trigger_wad: u128,           // 16   tight bound on band contents
-    pub max_trigger_wad: u128,           // 16
 
     pub _reserved: [u8; 32],             // 32
 }
 ```
 
-`LEN` = 8 + 32 + 4 + 1 + 1 + 2 + 32 + 32 + 4 + 4 + 16 + 16 + 32 = **184 bytes**.
+`LEN` = 8 + 32 + 4 + 1 + 1 + 2 + 4 + 4 + 32 = **88 bytes**.
+
+`count` is maintained by the program: `+1` on `OpenLoan`, `-1` on `RepayLoan`
+and on each in-swap liquidation. A loan never changes band (its trigger price is
+immutable), so `count` is an exact, drift-free tally of the band's membership —
+which is all the completeness proof in §6 needs. When `count` reaches 0 the
+band's bit in the Pool bitmap is cleared and the PDA's rent is refunded.
 
 ---
 
@@ -340,63 +312,47 @@ pub struct LoanIndexBand {
 - Tx size limit (~1232 B, ~64 accounts in v0 even with ALTs realistically) bounds
   how many loans a single swap can liquidate.
 
-### 6.2 Strategy
+### 6.2 Strategy — two structures, no linked list
 
-A two-level structure:
+The index is **bands + a Pool bitmap**. There is no per-loan link node and no
+intra-band ordering.
 
-- **Bands** partition price space into geometric buckets of fixed log-spacing.
-  e.g. `band_id = floor(log_{1.05}(trigger_price_wad / unit))`. Each band is a
-  PDA storing head/tail link pointers and a `count`. Bands are cheap to enumerate
-  off-chain because the key derivation is `["band", pool, direction, band_id]`.
-- **Intra-band linked list** — within a band, loans form a sorted doubly-linked
-  list of `LoanLink` accounts.
+- **Bands** partition price space into deterministic log2 buckets:
+  `band_id = floor(log2(trigger_price_wad)) + offset` (see `band_id_for_trigger`
+  in `math.rs`). Each populated `(pool, direction, band_id)` has a
+  `LoanIndexBand` PDA storing only a membership `count` (§5.3). Band membership
+  of a loan is a pure function of its (immutable) trigger price, so it never
+  needs maintenance.
+- **Pool bitmap** (`band_bitmap_fall` / `band_bitmap_rise`, 128 bits each): bit
+  `i` is set iff band `i` has `count > 0`. This is the on-chain source of truth
+  for "which bands are populated".
 
 Off-chain (caller / router):
-1. Read pool current price.
-2. Simulate swap to get `post_price` (assuming no liquidations).
-3. Enumerate bands between `current_price` and `post_price` for the relevant
-   direction.
-4. For each band, deterministically read its `LoanLink` chain (off-chain RPC walk).
-5. Pass to the program: `(Pool, [bands_in_play...], [loan_links_in_play...],
-   [loans_in_play...], [collateral_token_accounts_for_those_loans...])`.
+1. Read pool current price; simulate the swap to get a provisional `post_price`.
+2. From the bitmap, list the populated bands the price move crosses for the
+   relevant direction.
+3. For each such band, enumerate its open loans via `getProgramAccounts`
+   (filter: program id, `Loan` discriminator, `pool`, `band_id`, `direction`),
+   and sort them ascending by pubkey.
+4. Pass to the program: `(Pool, vaults, user accounts, [Band, Loan×k]…)` plus a
+   `band_boundary` asserting how far the price moves.
 
-On-chain:
-1. Verify each band PDA matches expected `band_id`.
-2. Verify each `LoanLink` belongs to a band that was supplied **and** that the
-   chain `prev/next` pointers are consistent with the supplied account ordering
-   (prevents the caller from skipping a triggered loan).
-3. Walk loans in order, applying liquidations until the next-trigger is past
-   `post_price`. Update `post_price` after each liquidation.
-4. Compute final swap output against the post-liquidation accounted reserves.
+On-chain — the **set-membership completeness proof** (see §6.3).
 
-### 6.3 Why this beats a single global linked list
-
-- A simple sorted list across all loans means: to find the next triggered loan,
-  the program walks from `head` until it finds one. Even if no loans are
-  triggered, the caller has to supply the head loan's link, the program reads it,
-  decides it's safe, done. Fine for a swap that triggers nothing.
-- But for a swap that crosses many bands, the linked list forces the caller to
-  supply every link from the head down to the last triggered loan, **even though
-  most are not in play**. Bands let the caller jump.
-
-### 6.4 Why we still need links inside a band
-
-- Without intra-band links, the caller would need to supply *every* loan in a
-  band even if only the first triggers — same problem as above, just smaller
-  scope. The intra-band linked list keeps "I supplied a contiguous prefix of
-  this band's chain" cheap to verify on-chain (each `next` pointer is checked
-  against the next supplied account).
-
-### 6.5 Completeness verification (the subtle part)
+### 6.3 Completeness verification (the subtle part)
 
 The program must reject input that **omits** a triggered loan that should have
-fired. The implemented check (see `instructions/swap.rs`) has three layers:
+fired. The check (see `instructions/swap.rs`) has three layers:
 
-1. **Per-band wholeness.** For every band the caller supplies, the supplied
-   link count must equal `band.count`, the first supplied link must equal
-   `band.head_link`, each `link[i].prev` must equal `link[i-1]`, and the last
-   supplied link's `next` must be `default()`. A caller therefore cannot hand
-   over a partial band — it's all-or-nothing per band.
+1. **Per-band wholeness by count.** For every band the caller supplies, the
+   supplied loan count must equal `band.count`, the loans must be sorted
+   *strictly* ascending by pubkey (⇒ distinct), and each must be open with a
+   cached `band_id` and `trigger_direction` matching the band. `k` distinct
+   members of a band whose true size is `band.count` are — by pigeonhole —
+   exactly the band. No band may be supplied twice, so supplied loans are
+   globally distinct. This needs no ordering state on-chain: the only trusted
+   datum is the integer `count`, which the program maintains and which cannot
+   drift (a loan never changes band).
 
 2. **Bitmap coverage.** The caller passes a `band_boundary: u32` asserting how
    far the price moves: for a falling price (`a_to_b`, OnFall) the post-swap
@@ -404,8 +360,7 @@ fired. The implemented check (see `instructions/swap.rs`) has three layers:
    `≤ band_boundary`. The program walks the pool's `band_bitmap_{fall,rise}`
    over the implied id range (`[band_boundary, MAX]` or `[0, band_boundary]`)
    and requires **every set bit** in that range to correspond to a supplied
-   band. Because the bitmap is the on-chain source of truth for "this band has
-   loans", a caller cannot silently drop a populated band on the path.
+   band. So a caller cannot silently drop a populated band on the path.
 
 3. **Post-cascade boundary recheck.** After the liquidation loop settles and
    the final swap is quoted, the program recomputes the true post-swap price's
@@ -413,11 +368,23 @@ fired. The implemented check (see `instructions/swap.rs`) has three layers:
    *past* the caller's claimed `band_boundary` — i.e. if more bands could have
    triggered than were proven complete in step 2.
 
-This bitmap scheme replaces the original "sentinel link" stop-condition design:
-the pool carries the populated-band set directly, so the program never has to
-read an extra read-only link to learn where the chain ends.
+This replaces an earlier doubly-linked-list design (`LoanLink` nodes with
+`prev`/`next` pointers, chain-walk verification, and a "sentinel link" stop
+condition). Once completeness became all-or-nothing per band, the ordering
+earned nothing; the set-membership proof above is both smaller and easier to
+audit (no pointer state to corrupt — see commit history / §6.4).
 
-### 6.6 Bounded liquidation per swap
+### 6.4 Why no linked list
+
+A linked list would let a swap supply a *prefix* of a band. But completeness is
+already all-or-nothing per band (you must supply every loan in any band you
+touch), so a prefix is never valid — the ordering bought nothing. Its only
+residual job, "prove the supplied set is exactly the band with no duplicates,"
+is handled by *count == k* + *strictly ascending pubkeys* + *no band supplied
+twice*. Dropping it removed an entire account type (`LoanLink`) and all the
+prev/next rewiring on open, repay, and liquidation.
+
+### 6.5 Bounded liquidation per swap
 
 - Hard cap: `MAX_LIQ_PER_SWAP` (start at 8, tune from CU measurements).
 - If more loans would trigger than the cap allows, the swap reverts with
@@ -426,24 +393,30 @@ read an extra read-only link to learn where the chain ends.
   to clear earlier loans. This is part of the "inventory stress, not default"
   failure mode.
 
-### 6.7 Open question — band sizing
+### 6.6 Band sizing
 
-Geometric base of 1.05 gives ~14 bands per 2× price range. SOL/USDC at $200
-spans `[$50, $800]` in ~57 bands. That's a lot of PDAs. Alternatives:
+**As implemented:** log base 2 bands (each band spans a 2× price range), a
+fixed set addressed by the 128-bit Pool bitmap (`MAX_BAND_ID = 127`). Sparse —
+a `LoanIndexBand` PDA exists only while a band has loans. Per-band membership is
+capped: `LoanIndexBand::MAX_LOANS = 64`, and `OpenLoan` reverts with `BandFull`
+once a band's 2× bucket is saturated. The cap bounds a swap's supplied account
+list (a crossed band's full membership must be handed over).
 
-- **Sparse bands** — only allocate band PDAs that contain at least one loan.
-  Empty bands don't exist; off-chain enumeration becomes "list all band PDAs
-  for this pool and filter". Costs an extra `getProgramAccounts` call.
-- **Fewer, wider bands** — log base 2 → ~1 band per 2× → 7 bands SOL/USDC.
-  Larger intra-band lists, more compute per liquidation walk.
-
-Suggested default: log base 2 bands (small fixed set), intra-band linked list,
-with a hard cap on intra-band count (e.g. 64) that forces band subdivision when
-exceeded.
-
-**As implemented:** `LoanIndexBand::MAX_LINKS = 64`, and `OpenLoan` reverts with
-`BandFull` once a band is saturated. The bitmap (§6.5) caps band ids at
-`MAX_BAND_ID = 127`.
+**`RebalanceBands` is retired — it will not be implemented.** The original
+subdivision idea predates the pivot to the bitmap index, which made band
+membership a *globally-deterministic* function of price
+(`band_id = floor(log2(trigger_price)) + offset`). A single band cannot be
+subdivided at runtime: the bitmap and `band_id_for_trigger` must agree across
+the whole pool, so finer granularity would have to change the band function for
+*every* band at once — a migration, not an in-place instruction. Subdivision
+also wouldn't raise swap-time capacity: `MAX_LIQ_PER_SWAP = 8` already bounds
+how many loans one swap can liquidate, so a dense price cluster needs multiple
+swaps regardless of how it's bucketed. `BandFull` therefore stands as the
+intended guard — it only limits *opening* a 65th loan whose trigger falls in an
+already-saturated 2× price bucket (an extreme concentration). If more
+open-loan headroom is ever genuinely needed, the coherent fix is a global
+finer-granularity band scheme (the bitmap already has 128 slots), introduced as
+a versioned migration.
 
 **`RebalanceBands` is retired — it will not be implemented.** The original
 subdivision idea predates the pivot to the bitmap index, which made band
@@ -465,56 +438,52 @@ a versioned migration.
 
 ## 7. Swap algorithm — account access pattern
 
-A `Swap` instruction takes:
+A `Swap` instruction takes a fixed prefix, then a liquidation context of
+`(Band, Loan×k)` groups — one group per `band_loan_counts[i]`. No collateral
+token accounts are needed: collateral is already in the vault, so liquidation is
+pure accounting.
 
 ```
+Fixed prefix:
 0.   [writable]  Pool
 1.   [writable]  Vault A
 2.   [writable]  Vault B
-3.   [writable]  User token account (input side)
-4.   [writable]  User token account (output side)
-5.   [signer]    User
-6.   []          Token program
-7.   []          Vault authority PDA
-8..N             Liquidation context, in order:
-                   [writable] Band PDA #1
-                   [writable] LoanLink #1.1
-                   [writable] Loan #1.1
-                   [writable] Borrower's collateral SPL account #1.1
-                   ...
-                   [writable] Sentinel link (read past last triggered) — optional
+3.   [writable]  User token account A
+4.   [writable]  User token account B
+5.   []          Mint A
+6.   []          Mint B
+7.   [signer]    User
+8.   []          Token program
+
+Per band (repeated for each entry in band_loan_counts):
+     [writable]  Band PDA
+     [writable]  Loan × k   (all of the band's open loans, sorted strictly
+                             ascending by pubkey)
 ```
 
 Algorithm:
 
 ```
-1. Load Pool, Vault A, Vault B; compute (real_a, real_b).
-2. Compute (accounted_a, accounted_b) = (real_a + total_debt_a,
-                                         real_b + total_debt_b).
-3. Determine direction (a→b raises price, b→a lowers price).
-4. Pre-quote on (accounted_a, accounted_b); compute provisional post_price.
-5. For each supplied band in order:
-    a. Verify band PDA, direction, completeness (§6.5).
-    b. For each supplied link in band:
-       i.  Verify link.next chain matches next supplied account.
-       ii. Load Loan; check trigger_direction matches & trigger crosses post_price.
-       iii. Apply liquidation:
-              - Move collateral_amount from borrower's collateral SPL acct → vault.
-              - total_debt_x -= debt; total_collateral_y -= collateral.
-              - Set Loan.status = liquidated; zero amounts.
-              - Unlink LoanLink (rewire prev/next; update band.count, band heads,
-                pool head if needed).
-       iv. Recompute (accounted_a, accounted_b), post_price.
-       v.  If next supplied link's trigger no longer crosses → stop band early.
-    c. Verify sentinel: first non-supplied link's trigger is past post_price,
-       or chain ended.
-6. Compute final swap output against the now-stable (accounted_a, accounted_b).
-7. Apply swap fee; split protocol_fee.
-8. Check: output_side ≤ corresponding real reserve.
-9. Check: user min_out / slippage.
-10. Transfer input from user → vault; transfer output from vault → user.
-11. Re-derive (accounted_a, accounted_b) post-swap; persist Pool.
-12. Emit SwapExecuted event with liquidation count.
+1. Load Pool, Vault A, Vault B; compute (real_a, real_b); bump borrow indexes.
+2. Compute (accounted_a, accounted_b) via Pool::accounted (collateral excluded,
+   outstanding debt included).
+3. Determine direction (a→b lowers price → OnFall set; b→a raises it → OnRise).
+4. Parse the tail: per band, verify the set-membership completeness proof
+   (§6.3.1) — count == k, strictly ascending distinct loans, matching band_id +
+   direction, no band supplied twice. Build the in-memory loan list.
+5. Verify bitmap coverage over [band_boundary, MAX] / [0, band_boundary] (§6.3.2).
+6. Iterate: quote on current accounted reserves → provisional post_price → find
+   the next supplied loan whose trigger has crossed → liquidate it (accounting
+   only: total_debt_x -= principal; total_collateral_y -= collateral) →
+   recompute accounted reserves. Stop when none remain or the cap is hit.
+7. Compute final swap output against the post-liquidation accounted reserves.
+8. Apply swap fee; accrue protocol_fee skim.
+9. Check: output ≤ swappable reserve (the solvency cap); check min_out.
+10. Post-cascade boundary recheck (§6.3.3).
+11. Tombstone liquidated loans (status=LIQUIDATED, amounts zeroed); decrement
+    each touched band's count; clear the bitmap bit for any band that emptied.
+12. Transfer input from user → vault; transfer output from vault → user.
+13. Persist Pool. Emit LoanLiquidated per loan + SwapExecuted.
 ```
 
 Failure modes:
@@ -573,7 +542,7 @@ Failure modes:
    trigger it? Probably not, since it'd be opened against the live pool price,
    but worth a note).
 4. **Band scheme** — log2 buckets + bitmap index, shipped. `RebalanceBands` is
-   retired (§6.7). The only remaining (optional) item is a CU benchmark to
+   retired (§6.6). The only remaining (optional) item is a CU benchmark to
    confirm the log2 base before a finer-granularity migration would ever be
    warranted.
 5. **Multi-hop / Jupiter integration** — completely deferred. Routers will need
@@ -591,21 +560,21 @@ Failure modes:
 
 | File | Status | Notes |
 |------|--------|-------|
-| `state.rs` | ✅ | Accounts §5; `Pool` carries the §6.5 band bitmaps + §8 indexes |
+| `state.rs` | ✅ | Accounts §5; `Pool` carries the §6 band bitmaps + §8 indexes |
 | `math.rs` | ✅ | CPMM quoting §8, trigger derivation §3, utilization-kink interest §8 |
 | `events.rs` | ✅ | Structured `sol_log_data` events (§11) |
 | `error.rs` | ✅ | |
 | `instructions/initialize_pool.rs` | ✅ | Validates Token-2022 extensions, creates vaults + LP mint |
 | `instructions/add_liquidity.rs` | ✅ | |
 | `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate |
-| `instructions/open_loan.rs` | ✅ | Also creates LoanLink, allocates/inserts into band |
-| `instructions/repay_loan.rs` | ✅ | Also unlinks; refunds Loan/LoanLink/empty-Band rent |
+| `instructions/open_loan.rs` | ✅ | Allocates band on first use; increments band count |
+| `instructions/repay_loan.rs` | ✅ | Decrements band count; refunds Loan + empty-Band rent |
 | `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |
 | `instructions/claim_protocol_fees.rs` | ✅ | Authority-only treasury drain |
 | `instructions/transfer_authority.rs` | ✅ | Rotate / renounce |
 | `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |
 | `instructions/update_pool_settings.rs` | ✅ | Prospective param retune |
-| `instructions/rebalance_bands.rs` | ⊘ | **Retired** — incoherent with deterministic log2 bands; see §6.7 |
+| `instructions/rebalance_bands.rs` | ⊘ | **Retired** — incoherent with deterministic log2 bands; see §6.6 |
 
 Integration tests live in the separate `integration-tests/` cargo project
 (`solana-program-test`), kept out of the deployable crate's lockfile so the
