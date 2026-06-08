@@ -158,7 +158,6 @@ pub struct Pool {
 
     // Lending config (collateral health)
     pub liq_ratio_bps: u16,              // 2    e.g. 11000 = 110%
-    pub liq_penalty_bps: u16,            // 2    bonus credited to pool on liquidation
     pub max_ltv_bps: u16,                // 2    initial borrow cap (< 1 / liq_ratio)
     pub _lending_pad: [u8; 2],           // 2
 
@@ -198,9 +197,9 @@ pub struct Pool {
 }
 ```
 
-`LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×3 + 2) + 2×4 + (16×2 + 8)
+`LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×2 + 2) + 2×4 + (16×2 + 8)
 + (32×2 + 4×2) + 8×3 + 8×2 + 16×2 + 32
-= 8 + 192 + 4 + 64 + 8 + 8 + 8 + 40 + 72 + 24 + 16 + 32 + 32 = **508 bytes**
+= 8 + 192 + 4 + 64 + 8 + 6 + 8 + 40 + 72 + 24 + 16 + 32 + 32 = **506 bytes**
 (verified by `state::tests::pool_size` borsh roundtrip).
 
 Notes:
@@ -443,11 +442,24 @@ with a hard cap on intra-band count (e.g. 64) that forces band subdivision when
 exceeded.
 
 **As implemented:** `LoanIndexBand::MAX_LINKS = 64`, and `OpenLoan` reverts with
-`BandFull` once a band is saturated. The `RebalanceBands` subdivision
-instruction is **not yet implemented** — a saturated band currently has no
-on-chain remedy beyond repaying/liquidating its loans. The bitmap (§6.5) caps
-band ids at `MAX_BAND_ID = 127`. Subdivision remains the planned escape hatch
-and is tracked as future work (see §9.4).
+`BandFull` once a band is saturated. The bitmap (§6.5) caps band ids at
+`MAX_BAND_ID = 127`.
+
+**`RebalanceBands` is retired — it will not be implemented.** The original
+subdivision idea predates the pivot to the bitmap index, which made band
+membership a *globally-deterministic* function of price
+(`band_id = floor(log2(trigger_price)) + offset`). A single band cannot be
+subdivided at runtime: the bitmap and `band_id_for_trigger` must agree across
+the whole pool, so finer granularity would have to change the band function for
+*every* band at once — a migration, not an in-place instruction. Subdivision
+also wouldn't raise swap-time capacity: `MAX_LIQ_PER_SWAP = 8` already bounds
+how many loans one swap can liquidate, so a dense price cluster needs multiple
+swaps regardless of how it's bucketed. `BandFull` therefore stands as the
+intended guard — it only limits *opening* a 65th loan whose trigger falls in an
+already-saturated 2× price bucket (an extreme concentration). If more
+open-loan headroom is ever genuinely needed, the coherent fix is a global
+finer-granularity band scheme (the bitmap already has 128 slots), introduced as
+a versioned migration.
 
 ---
 
@@ -560,8 +572,10 @@ Failure modes:
    lets you set up a loan that's instantly underwater but no one swaps to
    trigger it? Probably not, since it'd be opened against the live pool price,
    but worth a note).
-4. **Band scheme** — recommendation in §6.7. Need a CU benchmark before
-   committing.
+4. **Band scheme** — log2 buckets + bitmap index, shipped. `RebalanceBands` is
+   retired (§6.7). The only remaining (optional) item is a CU benchmark to
+   confirm the log2 base before a finer-granularity migration would ever be
+   warranted.
 5. **Multi-hop / Jupiter integration** — completely deferred. Routers will need
    a "preview liquidation context" RPC; design when we get there.
 6. **Borrower nonce** — using a per-pool monotonic `next_loan_nonce` keeps loan
@@ -591,7 +605,7 @@ Failure modes:
 | `instructions/transfer_authority.rs` | ✅ | Rotate / renounce |
 | `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |
 | `instructions/update_pool_settings.rs` | ✅ | Prospective param retune |
-| `instructions/rebalance_bands.rs` | ❌ | **Not implemented** — band subdivision; see §6.7 |
+| `instructions/rebalance_bands.rs` | ⊘ | **Retired** — incoherent with deterministic log2 bands; see §6.7 |
 
 Integration tests live in the separate `integration-tests/` cargo project
 (`solana-program-test`), kept out of the deployable crate's lockfile so the

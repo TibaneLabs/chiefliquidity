@@ -45,7 +45,6 @@ pub const LP_MINT_DECIMALS: u8 = 9;
 pub const MIN_LIQ_RATIO_BPS: u16 = 10_100; // 101%
 pub const MAX_LIQ_RATIO_BPS: u16 = 30_000; // 300%
 pub const MAX_SWAP_FEE_BPS: u16 = 1_000; // 10%
-pub const MAX_LIQ_PENALTY_BPS: u16 = 2_000; // 20%
 pub const MIN_LTV_BPS: u16 = 100; // 1%
 
 // Interest model bounds (all in bps-per-year, except kink which is bps of utilization).
@@ -75,7 +74,6 @@ pub fn process_initialize_pool(
     swap_fee_bps: u16,
     protocol_fee_bps: u16,
     liq_ratio_bps: u16,
-    liq_penalty_bps: u16,
     max_ltv_bps: u16,
     interest_base_bps_per_year: u16,
     interest_slope1_bps_per_year: u16,
@@ -127,7 +125,6 @@ pub fn process_initialize_pool(
         swap_fee_bps,
         protocol_fee_bps,
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         interest_base_bps_per_year,
         interest_slope1_bps_per_year,
@@ -254,7 +251,6 @@ pub fn process_initialize_pool(
         protocol_fee_bps,
         _curve_pad: [0; 3],
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         _lending_pad: [0; 2],
         interest_base_bps_per_year,
@@ -294,7 +290,6 @@ pub fn process_initialize_pool(
         swap_fee_bps,
         protocol_fee_bps,
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         interest_base_bps_per_year,
         interest_slope1_bps_per_year,
@@ -312,7 +307,6 @@ pub fn validate_params(
     swap_fee_bps: u16,
     protocol_fee_bps: u16,
     liq_ratio_bps: u16,
-    liq_penalty_bps: u16,
     max_ltv_bps: u16,
     interest_base_bps_per_year: u16,
     interest_slope1_bps_per_year: u16,
@@ -326,9 +320,6 @@ pub fn validate_params(
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
     if liq_ratio_bps < MIN_LIQ_RATIO_BPS || liq_ratio_bps > MAX_LIQ_RATIO_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if liq_penalty_bps > MAX_LIQ_PENALTY_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
     if max_ltv_bps < MIN_LTV_BPS {

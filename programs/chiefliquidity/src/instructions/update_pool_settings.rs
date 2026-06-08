@@ -32,7 +32,6 @@ pub fn process_update_pool_settings(
     swap_fee_bps: u16,
     protocol_fee_bps: u16,
     liq_ratio_bps: u16,
-    liq_penalty_bps: u16,
     max_ltv_bps: u16,
     interest_base_bps_per_year: u16,
     interest_slope1_bps_per_year: u16,
@@ -73,7 +72,6 @@ pub fn process_update_pool_settings(
         swap_fee_bps,
         protocol_fee_bps,
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         interest_base_bps_per_year,
         interest_slope1_bps_per_year,
@@ -91,7 +89,6 @@ pub fn process_update_pool_settings(
     pool.swap_fee_bps = swap_fee_bps;
     pool.protocol_fee_bps = protocol_fee_bps;
     pool.liq_ratio_bps = liq_ratio_bps;
-    pool.liq_penalty_bps = liq_penalty_bps;
     pool.max_ltv_bps = max_ltv_bps;
     pool.interest_base_bps_per_year = interest_base_bps_per_year;
     pool.interest_slope1_bps_per_year = interest_slope1_bps_per_year;
@@ -104,11 +101,10 @@ pub fn process_update_pool_settings(
     }
 
     msg!(
-        "UpdatePoolSettings swap_fee={} prot_fee={} liq_ratio={} liq_pen={} max_ltv={} base={} s1={} s2={} kink={}",
+        "UpdatePoolSettings swap_fee={} prot_fee={} liq_ratio={} max_ltv={} base={} s1={} s2={} kink={}",
         swap_fee_bps,
         protocol_fee_bps,
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         interest_base_bps_per_year,
         interest_slope1_bps_per_year,
@@ -120,7 +116,6 @@ pub fn process_update_pool_settings(
         swap_fee_bps,
         protocol_fee_bps,
         liq_ratio_bps,
-        liq_penalty_bps,
         max_ltv_bps,
         interest_base_bps_per_year,
         interest_slope1_bps_per_year,

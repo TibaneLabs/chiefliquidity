@@ -85,7 +85,6 @@ pub struct Pool {
 
     // Lending config (collateral health)
     pub liq_ratio_bps: u16,
-    pub liq_penalty_bps: u16,
     pub max_ltv_bps: u16,
     pub _lending_pad: [u8; 2],
 
@@ -137,7 +136,7 @@ impl Pool {
         + 4                                   // 4× bump
         + 16 * 4                              // 4× u128 debt/collateral totals
         + 1 + 2 + 2 + 3                       // curve_kind, swap_fee_bps, protocol_fee_bps, _curve_pad
-        + 2 * 3 + 2                           // 3× u16 lending bps + _lending_pad (was 4× + 8 pad)
+        + 2 * 2 + 2                           // liq_ratio_bps, max_ltv_bps + _lending_pad
         + 2 * 4                               // 4× u16 interest model params
         + 16 * 2 + 8                          // borrow_index_a/b_wad + last_index_update_slot
         + 32 * 2 + 4 * 2                      // head_fall, head_rise, band_count_fall, band_count_rise
@@ -578,7 +577,6 @@ mod tests {
             protocol_fee_bps: 5,
             _curve_pad: [0; 3],
             liq_ratio_bps: 11000,
-            liq_penalty_bps: 500,
             max_ltv_bps: 8000,
             _lending_pad: [0; 2],
             interest_base_bps_per_year: 0,
@@ -861,7 +859,7 @@ mod tests {
     /// guard against accidental layout breakage.
     #[test]
     fn known_sizes() {
-        assert_eq!(Pool::LEN, 508);
+        assert_eq!(Pool::LEN, 506);
         assert_eq!(Loan::LEN, 210);
         assert_eq!(LoanLink::LEN, 176);
         assert_eq!(LoanIndexBand::LEN, 184);

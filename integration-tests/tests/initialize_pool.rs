@@ -105,7 +105,6 @@ async fn rejects_unsorted_mints() {
         swap_fee_bps: params.swap_fee_bps,
         protocol_fee_bps: params.protocol_fee_bps,
         liq_ratio_bps: params.liq_ratio_bps,
-        liq_penalty_bps: params.liq_penalty_bps,
         max_ltv_bps: params.max_ltv_bps,
         interest_base_bps_per_year: params.interest_base_bps_per_year,
         interest_slope1_bps_per_year: params.interest_slope1_bps_per_year,
