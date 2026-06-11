@@ -54,12 +54,12 @@ jobs:
             --rpc-port 8899 \
             --faucet-port 9900 \
             --slots-per-epoch 32 \
-            --upgradeable-program D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW target/deploy/chiefliquidity.so ~/.config/solana/id.json \
+            --upgradeable-program GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF target/deploy/chiefliquidity.so ~/.config/solana/id.json \
             --log &
           sleep 5
 
       - name: Verify program loaded
-        run: solana program show D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW
+        run: solana program show GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF
 
       - uses: actions/setup-node@v4
         with:

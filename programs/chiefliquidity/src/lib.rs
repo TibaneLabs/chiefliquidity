@@ -18,9 +18,10 @@ pub mod state;
 
 use instructions::*;
 
-// Matches target/deploy/chiefliquidity-keypair.json. Regenerate the keypair
-// (and update this constant) before publishing to a public cluster.
-solana_program::declare_id!("D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW");
+// Canonical program ID (vanity address ending in "cHieF"). The matching
+// keypair lives at ~/.config/solana/chiefliquidity-program.json and is used
+// only for the initial deploy; upgrades are gated by the upgrade authority.
+solana_program::declare_id!("GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF");
 
 /// Program instructions.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]

@@ -7,7 +7,7 @@
  *   ./scripts/run-e2e-tests.sh        (builds, starts validator, runs this)
  * or manually:
  *   1. cargo build-sbf --workspace
- *   2. solana-test-validator --upgradeable-program D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW \
+ *   2. solana-test-validator --upgradeable-program GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF \
  *        target/deploy/chiefliquidity.so ~/.config/solana/id.json
  *   3. cd tests/typescript && npm install && npm test
  *
@@ -47,7 +47,7 @@ import bs58 from 'bs58';
 
 // ===== Program constants (must match programs/chiefliquidity/src) =====
 
-const PROGRAM_ID = new PublicKey('D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW');
+const PROGRAM_ID = new PublicKey('GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF');
 
 const POOL_SEED = Buffer.from('pool');
 const VAULT_A_SEED = Buffer.from('vault_a');

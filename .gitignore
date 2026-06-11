@@ -20,3 +20,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Vanity-key grind workspace
+.grind/
