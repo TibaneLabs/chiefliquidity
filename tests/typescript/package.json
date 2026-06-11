@@ -1,0 +1,18 @@
+{
+  "name": "chiefliquidity-tests",
+  "version": "1.0.0",
+  "description": "E2E tests for ChiefLiquidity program",
+  "scripts": {
+    "test": "npx ts-node --transpile-only test_liquidity.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0",
+    "bs58": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}

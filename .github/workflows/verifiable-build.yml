@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Cancel an in-progress run when a newer one starts for the same ref+event,
+# so pushes don't pile up stale runs competing for runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 env:
   SOLANA_VERSION: v2.0.25
 
@@ -54,6 +60,18 @@ jobs:
 
       - name: Verify program loaded
         run: solana program show D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install E2E test dependencies
+        working-directory: tests/typescript
+        run: npm install
+
+      - name: Run E2E tests against live validator
+        working-directory: tests/typescript
+        run: npm test
 
   verifiable-build:
     needs: unit-and-build

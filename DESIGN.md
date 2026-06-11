@@ -568,6 +568,14 @@ Integration tests live in the separate `integration-tests/` cargo project
 (`solana-program-test`), kept out of the deployable crate's lockfile so the
 verifiable-build container (cargo 1.78) can parse it.
 
+End-to-end tests live in `tests/typescript/` (same layout as
+`../chiefstaker`): a ts-node suite run against a live `solana-test-validator`
+over RPC, covering every instruction on both token programs plus the
+off-chain router flow (§6.2 — bitmap walk + `getProgramAccounts` band
+enumeration), adversarial completeness attacks, the liquidation / band caps,
+and conservation checks. Run locally via `./scripts/run-e2e-tests.sh`; CI
+runs it on every push (`.github/workflows/verifiable-build.yml`).
+
 ---
 
 ## 11. Events
