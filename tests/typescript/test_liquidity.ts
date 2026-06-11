@@ -1492,7 +1492,24 @@ async function runTests() {
   process.exit(failed > 0 ? 1 : 0);
 }
 
-runTests().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Only auto-run when invoked directly (`ts-node test_liquidity.ts`). When
+// imported by test_adversarial.ts to reuse the harness, this stays dormant.
+if (require.main === module) {
+  runTests().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
+
+// Shared harness surface for sibling test files (e.g. test_adversarial.ts).
+export {
+  Ctx, Err, Ix, DEFAULT_PARAMS,
+  COLL_A, COLL_B, DIR_FALL, DIR_RISE,
+  PROGRAM_ID, POOL_SEED, VAULT_A_SEED, VAULT_B_SEED, LP_MINT_SEED, LOAN_SEED, BAND_SEED,
+  LOAN_LEN, BAND_LEN, POOL_LEN, LOAN_OFF, LOAN_DISCRIMINATOR,
+  WAD, BPS, BAND_MAX_LOANS, MAX_LIQ_PER_SWAP,
+  recomputeTrigger, bandIdForTrigger, bitmapIsSet, cpmmQuoteOut, isqrt, sleep, waitFor,
+  decodePool, decodeLoan, decodeBand,
+  assert, assertEq, expectError, customErrorCode,
+};
+export type { PoolParams, PoolState, LoanState, BandState };
