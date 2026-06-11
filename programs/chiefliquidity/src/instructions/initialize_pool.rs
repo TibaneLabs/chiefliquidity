@@ -315,7 +315,7 @@ pub fn validate_params(
     if protocol_fee_bps > swap_fee_bps {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
-    if liq_ratio_bps < MIN_LIQ_RATIO_BPS || liq_ratio_bps > MAX_LIQ_RATIO_BPS {
+    if !(MIN_LIQ_RATIO_BPS..=MAX_LIQ_RATIO_BPS).contains(&liq_ratio_bps) {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
     if max_ltv_bps < MIN_LTV_BPS {
@@ -339,7 +339,7 @@ pub fn validate_params(
     if interest_slope2_bps_per_year > MAX_INTEREST_SLOPE2_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
-    if interest_kink_bps < MIN_KINK_BPS || interest_kink_bps > MAX_KINK_BPS {
+    if !(MIN_KINK_BPS..=MAX_KINK_BPS).contains(&interest_kink_bps) {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
     Ok(())
@@ -473,7 +473,7 @@ fn create_lp_mint<'a>(
             Some(pool_info.key), // freeze authority = pool PDA
             LP_MINT_DECIMALS,
         )?,
-        &[lp_mint_info.clone()],
+        std::slice::from_ref(lp_mint_info),
         &[seeds],
     )?;
     Ok(())

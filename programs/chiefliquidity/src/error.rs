@@ -125,7 +125,7 @@ pub enum LiquidityError {
     #[error("Band PDA does not match supplied (pool, direction, band_id)")]
     BandMismatch,
 
-    #[error("Band has reached its capacity - call RebalanceBands first")]
+    #[error("Band has reached its capacity - no more loans can open in this price bucket")]
     BandFull,
 
     #[error("Swap would require more liquidations than the per-tx cap permits")]

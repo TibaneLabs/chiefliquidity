@@ -226,8 +226,6 @@ pub fn process_open_loan(
         };
         let mut data = band_info.try_borrow_mut_data()?;
         new_band.serialize(&mut &mut data[..])?;
-        // Band goes from empty → populated: set its presence bit.
-        bitmap_set(pool.band_bitmap_mut(direction_byte)?, band_id)?;
     }
 
     // Load (and update) band
@@ -245,6 +243,14 @@ pub fn process_open_loan(
     }
     if band.count >= LoanIndexBand::MAX_LOANS {
         return Err(LiquidityError::BandFull.into());
+    }
+    if band.count == 0 {
+        // Band goes from empty → populated: set its presence bit. This must
+        // key off `count`, not off PDA allocation — a swap that liquidates a
+        // band's last loan clears the bit but leaves the PDA allocated, and a
+        // loan added to such a band would otherwise be invisible to the swap
+        // completeness proof (it could never be liquidated).
+        bitmap_set(pool.band_bitmap_mut(direction_byte)?, band_id)?;
     }
 
     // ---- Persist Loan ----

@@ -270,6 +270,97 @@ async fn swap_skipping_populated_band_rejected() {
     );
 }
 
+// ============ Regression: reopening a swap-emptied band ============
+//
+// A swap that liquidates a band's last loan clears the band's bitmap bit but
+// leaves the band PDA allocated (count = 0, rent recoverable later). A loan
+// subsequently opened into that band must re-set the bit — otherwise the loan
+// is invisible to the completeness proof and can never be liquidated.
+
+#[tokio::test]
+async fn reopened_band_after_liquidation_is_tracked_in_bitmap() {
+    let mut env = TestEnv::new().await;
+    let _ = env
+        .setup_pool_with_liquidity(1_000_000_000, 4_000_000_000)
+        .await;
+
+    // Loan 1: coll 100M A, debt 300M B → trigger 3.3 B/A (band 66, OnFall).
+    let (borrower1, b1_a, b1_b, _) =
+        env.setup_user(10_000_000_000, 100_000_000, 0).await;
+    env.open_loan(&borrower1, &b1_a, &b1_b, COLL_A, 100_000_000, 300_000_000)
+        .await
+        .unwrap();
+    let (trigger1, _) = chiefliquidity::math::recompute_trigger(
+        chiefliquidity::math::LoanSides::CollateralA,
+        100_000_000,
+        300_000_000,
+        11_000,
+    )
+    .unwrap();
+    let band_id = chiefliquidity::math::band_id_for_trigger(trigger1).unwrap();
+
+    // Swap A→B liquidates loan 1, emptying the band: bit cleared, PDA kept.
+    let (trader, t_a, t_b, _) = env.setup_user(10_000_000_000, 300_000_000, 0).await;
+    env.swap_full(&trader, &t_a, &t_b, 200_000_000, 1, true)
+        .await
+        .unwrap();
+
+    let pool = env.pool_state().await;
+    assert_eq!(pool.open_loans, 0);
+    assert!(
+        !chiefliquidity::state::bitmap_is_set(&pool.band_bitmap_fall, band_id),
+        "emptied band's bit must be cleared"
+    );
+    let band = env.band_state(0, band_id).await.expect("band PDA persists");
+    assert_eq!(band.count, 0);
+
+    // Push the price back up (B→A) so a new loan's trigger can land in the
+    // same band. Post-liquidation price ≈ 2.41; this brings it to ≈ 3.6.
+    let (pumper, p_a, p_b, _) = env.setup_user(10_000_000_000, 0, 700_000_000).await;
+    env.swap_full(&pumper, &p_a, &p_b, 700_000_000, 1, false)
+        .await
+        .unwrap();
+
+    // Loan 2: coll 100M A, debt 250M B → trigger 2.75 — same band 66.
+    let (borrower2, b2_a, b2_b, _) =
+        env.setup_user(10_000_000_000, 100_000_000, 0).await;
+    env.open_loan(&borrower2, &b2_a, &b2_b, COLL_A, 100_000_000, 250_000_000)
+        .await
+        .unwrap();
+    let (trigger2, _) = chiefliquidity::math::recompute_trigger(
+        chiefliquidity::math::LoanSides::CollateralA,
+        100_000_000,
+        250_000_000,
+        11_000,
+    )
+    .unwrap();
+    assert_eq!(
+        chiefliquidity::math::band_id_for_trigger(trigger2).unwrap(),
+        band_id,
+        "test setup must reuse the emptied band"
+    );
+
+    // The reused band must be visible again in the pool bitmap…
+    let pool = env.pool_state().await;
+    assert!(
+        chiefliquidity::state::bitmap_is_set(&pool.band_bitmap_fall, band_id),
+        "reopened band's bit must be re-set"
+    );
+    let band = env.band_state(0, band_id).await.unwrap();
+    assert_eq!(band.count, 1);
+
+    // …so a swap omitting it is rejected rather than silently skipping the loan.
+    let (trader2, t2_a, t2_b, _) = env.setup_user(10_000_000_000, 200_000_000, 0).await;
+    let err = env
+        .swap(&trader2, &t2_a, &t2_b, 200_000_000, 1, true, 0, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        extract_custom_error(&err),
+        Some(err_code(LiquidityError::IncompleteBandWalk))
+    );
+}
+
 // ============ Adversarial: too many liquidations ============
 //
 // Hitting MAX_LIQ_PER_SWAP = 8 requires opening 9+ loans that all trigger on

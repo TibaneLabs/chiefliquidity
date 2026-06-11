@@ -296,8 +296,8 @@ pub fn process_repay_loan(
     Ok(())
 }
 
-/// Drain lamports to `dest`, clear data, and reassign owner so the runtime
-/// can garbage-collect the account at end of tx.
+/// Drain lamports to `dest` and zero the data; with zero lamports the
+/// runtime garbage-collects the account at the end of the transaction.
 fn close_account<'a>(
     account: &AccountInfo<'a>,
     dest: &AccountInfo<'a>,

@@ -151,35 +151,6 @@ pub enum LiquidityInstruction {
     /// 10. `[]`        Token program
     RepayLoan,
 
-    /// Swap with mandatory in-flight liquidation. See DESIGN.md §7.
-    ///
-    /// Caller supplies all bands+loans whose liquidation might be triggered by
-    /// the price move. The program iteratively (a) computes the post-swap
-    /// price, (b) finds the next supplied loan whose direction matches and
-    /// whose trigger has been crossed, (c) liquidates it, and (d) recomputes.
-    /// After the loop terminates, the swap is quoted on the final accounted
-    /// reserves and committed only if it satisfies the user's `min_out` and the
-    /// pool's executable cap.
-    ///
-    /// `band_loan_counts[i]` = number of loans supplied for the `i`-th band
-    /// (must equal that band's `count`). The total tail account count is
-    /// `Σ (1 + band_loan_counts[i])`.
-    ///
-    /// Accounts (fixed prefix):
-    /// 0. `[writable]` Pool
-    /// 1. `[writable]` Vault A
-    /// 2. `[writable]` Vault B
-    /// 3. `[writable]` User token A
-    /// 4. `[writable]` User token B
-    /// 5. `[]`         Mint A
-    /// 6. `[]`         Mint B
-    /// 7. `[signer]`   User
-    /// 8. `[]`         Token program
-    ///
-    /// Accounts (per band, repeated for each entry in `band_loan_counts`):
-    ///   `[writable]` Band PDA
-    ///   `[writable]` Loan × K (all of the band's open loans, sorted strictly
-    ///                ascending by pubkey)
     /// Authority-only: drain accumulated protocol fees from the vaults to
     /// the authority's token accounts. Resets `protocol_fees_a` and
     /// `protocol_fees_b` to 0. No-op if both are already 0.
@@ -212,7 +183,7 @@ pub enum LiquidityInstruction {
     /// Accounts:
     /// 0. `[writable]` Loan (status=LIQUIDATED, drained + zeroed)
     /// 1. `[writable, signer]` Borrower (lamport recipient; must match
-    ///                  `Loan.borrower`)
+    ///    `Loan.borrower`)
     ClaimLiquidatedRent,
 
     /// Authority-only: retune fee/liquidation/LTV/interest parameters
@@ -238,6 +209,35 @@ pub enum LiquidityInstruction {
         interest_kink_bps: u16,
     },
 
+    /// Swap with mandatory in-flight liquidation. See DESIGN.md §7.
+    ///
+    /// Caller supplies all bands+loans whose liquidation might be triggered by
+    /// the price move. The program iteratively (a) computes the post-swap
+    /// price, (b) finds the next supplied loan whose direction matches and
+    /// whose trigger has been crossed, (c) liquidates it, and (d) recomputes.
+    /// After the loop terminates, the swap is quoted on the final accounted
+    /// reserves and committed only if it satisfies the user's `min_out` and the
+    /// pool's executable cap.
+    ///
+    /// `band_loan_counts[i]` = number of loans supplied for the `i`-th band
+    /// (must equal that band's `count`). The total tail account count is
+    /// `Σ (1 + band_loan_counts[i])`.
+    ///
+    /// Accounts (fixed prefix):
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` User token A
+    /// 4. `[writable]` User token B
+    /// 5. `[]`         Mint A
+    /// 6. `[]`         Mint B
+    /// 7. `[signer]`   User
+    /// 8. `[]`         Token program
+    ///
+    /// Accounts (per band, repeated for each entry in `band_loan_counts`):
+    ///   `[writable]` Band PDA
+    ///   `[writable]` Loan × K (all of the band's open loans, sorted strictly
+    ///                ascending by pubkey)
     Swap {
         amount_in: u64,
         min_out: u64,

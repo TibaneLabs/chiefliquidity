@@ -72,10 +72,10 @@ For a loan with collateral side `c` and debt side `d`, define `trigger_price` in
 
 | Collateral | Debt | Direction loan triggers when price… | `trigger_price` (B-per-A) |
 |-----------:|:-----|:------------------------------------|:--------------------------|
-| A          | B    | …rises above threshold (collateral A loses value relative to debt B) | `(debt_b × liq_ratio) / collateral_a` |
-| B          | A    | …falls below threshold (collateral B loses value relative to debt A) | `collateral_b / (debt_a × liq_ratio)` |
+| A          | B    | …falls below threshold (collateral A loses value relative to debt B) | `(debt_b × liq_ratio) / collateral_a` |
+| B          | A    | …rises above threshold (collateral B loses value relative to debt A) | `collateral_b / (debt_a × liq_ratio)` |
 
-Wait — re-derive the A-collateral case carefully. Liquidation fires when
+Derivation: liquidation fires when
 `collateral_value_in_debt_terms < debt × liq_ratio`:
 
 - Collateral A, debt B:
@@ -295,7 +295,11 @@ pub struct LoanIndexBand {
 and on each in-swap liquidation. A loan never changes band (its trigger price is
 immutable), so `count` is an exact, drift-free tally of the band's membership —
 which is all the completeness proof in §6 needs. When `count` reaches 0 the
-band's bit in the Pool bitmap is cleared and the PDA's rent is refunded.
+band's bit in the Pool bitmap is cleared; `RepayLoan` additionally closes the
+PDA and refunds its rent, while a swap that empties a band leaves the PDA
+allocated (`count = 0`). The bitmap — not PDA existence — is therefore the
+source of truth for "populated", and `OpenLoan` sets the bit whenever `count`
+goes 0 → 1 (covering both a fresh PDA and a swap-emptied one being reused).
 
 ---
 
@@ -318,8 +322,8 @@ The index is **bands + a Pool bitmap**. There is no per-loan link node and no
 intra-band ordering.
 
 - **Bands** partition price space into deterministic log2 buckets:
-  `band_id = floor(log2(trigger_price_wad)) + offset` (see `band_id_for_trigger`
-  in `math.rs`). Each populated `(pool, direction, band_id)` has a
+  `band_id = floor(log2(trigger_price_wad)) − floor(log2(WAD)) + offset`
+  (see `band_id_for_trigger` in `math.rs`). Each populated `(pool, direction, band_id)` has a
   `LoanIndexBand` PDA storing only a membership `count` (§5.3). Band membership
   of a loan is a pure function of its (immutable) trigger price, so it never
   needs maintenance.
@@ -401,22 +405,6 @@ a `LoanIndexBand` PDA exists only while a band has loans. Per-band membership is
 capped: `LoanIndexBand::MAX_LOANS = 64`, and `OpenLoan` reverts with `BandFull`
 once a band's 2× bucket is saturated. The cap bounds a swap's supplied account
 list (a crossed band's full membership must be handed over).
-
-**`RebalanceBands` is retired — it will not be implemented.** The original
-subdivision idea predates the pivot to the bitmap index, which made band
-membership a *globally-deterministic* function of price
-(`band_id = floor(log2(trigger_price)) + offset`). A single band cannot be
-subdivided at runtime: the bitmap and `band_id_for_trigger` must agree across
-the whole pool, so finer granularity would have to change the band function for
-*every* band at once — a migration, not an in-place instruction. Subdivision
-also wouldn't raise swap-time capacity: `MAX_LIQ_PER_SWAP = 8` already bounds
-how many loans one swap can liquidate, so a dense price cluster needs multiple
-swaps regardless of how it's bucketed. `BandFull` therefore stands as the
-intended guard — it only limits *opening* a 65th loan whose trigger falls in an
-already-saturated 2× price bucket (an extreme concentration). If more
-open-loan headroom is ever genuinely needed, the coherent fix is a global
-finer-granularity band scheme (the bitmap already has 128 slots), introduced as
-a versioned migration.
 
 **`RebalanceBands` is retired — it will not be implemented.** The original
 subdivision idea predates the pivot to the bitmap index, which made band

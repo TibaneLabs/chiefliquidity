@@ -471,7 +471,7 @@ impl LoanIndexBand {
     /// Hard cap on open loans per band. `OpenLoan` reverts with `BandFull` once
     /// a band's 2× price bucket holds this many loans; the bound keeps a swap's
     /// supplied account list (which must include a crossed band's full
-    /// membership) within tx limits. See `DESIGN.md` §6.7.
+    /// membership) within tx limits. See `DESIGN.md` §6.6.
     pub const MAX_LOANS: u32 = 64;
 
     pub fn is_initialized(&self) -> bool {

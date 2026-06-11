@@ -64,7 +64,7 @@ pub fn isqrt_u128(n: u128) -> u128 {
     }
     // Initial estimate: 2^(ceil(log2(n)) / 2). Use a fast bit-length-based seed.
     let bits = 128 - n.leading_zeros() as u128;
-    let mut x = 1u128 << ((bits + 1) / 2);
+    let mut x = 1u128 << bits.div_ceil(2);
     loop {
         let y = (x + n / x) / 2;
         if y >= x {
@@ -395,14 +395,14 @@ pub fn is_liquidatable(
 /// non-negative `u32` ids.
 ///
 /// `floor(log2(WAD))` for `WAD = 10^18` is `59`. We pick `BAND_OFFSET = 64` so
-/// `price = 1.0` lands at band `63`. Each step of `band_id` is a 2× change
+/// `price = 1.0` lands at band `64`. Each step of `band_id` is a 2× change
 /// in price.
 pub const BAND_OFFSET: u32 = 64;
 const LOG2_WAD: u32 = 59;
 
 /// Compute `band_id` for the given trigger price (WAD-scaled).
 ///
-/// `price = 1.0` → 63, `2.0` → 64, `0.5` → 62, etc.
+/// `price = 1.0` → 64, `2.0` → 65, `0.5` → 63, etc.
 /// Errors on `trigger_price_wad == 0`.
 pub fn band_id_for_trigger(trigger_price_wad: u128) -> Result<u32, LiquidityError> {
     if trigger_price_wad == 0 {
@@ -574,14 +574,8 @@ mod tests {
 
     #[test]
     fn test_band_id_for_trigger() {
-        // price = 1.0 → log2 = 59 → band_id = 59 + 64 - 59 = 64? Wait:
-        // band_id = log2_x + BAND_OFFSET - LOG2_WAD
-        //         = 59 + 64 - 59 = 64.
-        // But WAD has bit length 60, so floor(log2(WAD)) = 59 ✓.
-        // Hmm — design said price 1.0 → band 63, but actually it's 64.
-        // The "price 1.0 → 63" comment in math.rs is just example arithmetic;
-        // exact value depends on which side of WAD you land. For WAD itself
-        // (price = 1.0), band_id = 64.
+        // band_id = floor(log2(price_wad)) + BAND_OFFSET - LOG2_WAD.
+        // floor(log2(WAD)) = 59, so price = 1.0 → 59 + 64 - 59 = 64.
         assert_eq!(band_id_for_trigger(WAD).unwrap(), 64);
         assert_eq!(band_id_for_trigger(2 * WAD).unwrap(), 65);
         assert_eq!(band_id_for_trigger(WAD / 2).unwrap(), 63);
