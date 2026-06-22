@@ -465,6 +465,56 @@ async function run() {
     await checkInvariants(ctx, connection);
   });
 
+  await T('Inflation via remove-to-dust + donation cannot steal a depositor', async (ctx) => {
+    // The MIN_FIRST_DEPOSIT floor only gates the *first* deposit; it does NOT
+    // permanently lock a minimum LP supply the way Uniswap-v2's burned
+    // MINIMUM_LIQUIDITY does. So an attacker can satisfy the floor, then
+    // RemoveLiquidity back down to a single LP unit and donate raw tokens to
+    // inflate the share price — the classic first-depositor inflation setup,
+    // reached here via remove (the existing probe above keeps full supply, so
+    // it never exercises this path). The guarantee under test: a victim's
+    // deposit can never be pocketed for zero LP.
+    await ctx.initializePool();
+    // One wallet plays the whole attack: seed capital + donation capital.
+    const attacker = await ctx.newUser(10, 200_000_000n, 2_000_000n);
+    await ctx.addLiquidity(attacker, 1_000_000n, 1_000_000n, 1n); // exactly MIN_FIRST_DEPOSIT
+    assertEq(await ctx.lpSupply(), 1_000_000n, 'first deposit minted sqrt(1e6*1e6)');
+
+    // Drain supply to a single LP unit — the step the existing probe omits.
+    // Proves the supply floor is not permanent.
+    await ctx.removeLiquidity(attacker, 999_999n, 1n, 1n);
+    assertEq(await ctx.lpSupply(), 1n, 'supply driven to one LP unit via remove');
+    await checkInvariants(ctx, connection);
+
+    // Inflate the share price: donate raw tokens straight to the vault so the
+    // lone LP unit now backs a huge A reserve (accounted_a ≫ accounted_b).
+    await transfer(connection, payer, ctx.ata(attacker.publicKey, ctx.mintA), ctx.vaultA,
+      attacker, 100_000_000n, [], { commitment: 'confirmed' }, ctx.tokenProgram);
+    await checkInvariants(ctx, connection);
+
+    // Victim makes an ordinary balanced deposit. With accounted_a ~1e8 against
+    // supply=1, the proportional B side rounds to zero, so lp_to_mint is zero.
+    // The program MUST reject this rather than transfer the victim's tokens for
+    // no LP — that rejection is the entire anti-theft guarantee.
+    const victim = await ctx.newUser(10, 1_000_000_000n, 1_000_000_000n);
+    const aBefore = await ctx.tokenBalance(victim.publicKey, ctx.mintA);
+    const bBefore = await ctx.tokenBalance(victim.publicKey, ctx.mintB);
+    await expectError(ctx.addLiquidity(victim, 50_000_000n, 50_000_000n, 1n),
+      Err.ZeroAmount, 'donation-skewed deposit rounds to zero LP → reverts');
+
+    // The reverted tx committed nothing: no tokens left the victim.
+    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintA), aBefore, 'victim A untouched');
+    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintB), bBefore, 'victim B untouched');
+
+    // The grief is unprofitable: burning the last LP unwinds the pool and hands
+    // the inflated reserves back to the attacker, so they only ever locked their
+    // own donated capital — nothing was extracted from the victim.
+    await ctx.removeLiquidity(attacker, 1n, 1n, 1n);
+    assertEq(await ctx.lpSupply(), 0n, 'attacker burns last LP, pool fully unwound');
+    const { a, b } = await ctx.vaultBalances();
+    assert(a === 0n && b === 0n, `pool drained to empty, no value stranded (a=${a} b=${b})`);
+  });
+
   console.log('\n---------- Randomized invariant fuzzer ----------\n');
 
   await test('Fuzz: random op sequence preserves all invariants', async () => {
