@@ -530,13 +530,20 @@ Failure modes:
    trigger it? Probably not, since it'd be opened against the live pool price,
    but worth a note).
 4. **Band scheme** — ✅ resolved. log2 buckets + bitmap index, shipped;
-   `RebalanceBands` is retired (§6.6). The CU benchmark is now in place
+   `RebalanceBands` is retired (§6.6). The benchmark is now in place
    (`tests/typescript/test_benchmark.ts`): the worst-case cascade — 8
    liquidations across 8 *distinct* bands (max band-PDA loads) — measures
    ~129k CU, under 10% of the 1.4M per-tx ceiling, at ~9.6k CU marginal per
-   liquidation and ~2.2k CU per extra band PDA. The `MAX_LIQ_PER_SWAP = 8` cap
-   is confirmed to be a policy choice, not a budget limit (the budget alone
-   would allow ~140), so the log2 base needs no change.
+   liquidation. **CU is not what bounds `MAX_LIQ_PER_SWAP = 8`** — by compute
+   alone the budget would fit ~140 liquidations. The binding constraint is the
+   **1232-byte legacy transaction**: every liquidated loan + its band PDA is a
+   32-byte account key, so the account list fills the transaction at roughly
+   8–20 liquidations (worst-case distinct-band spread vs. a single dense band).
+   The cap of 8 is sized to the safe worst-case spread and the benchmark
+   asserts the cap-depth swap serializes under 1232 bytes. Raising the cap
+   would require migrating the client/router to v0 transactions + address
+   lookup tables (256-account ceiling), not a bigger compute budget — deferred
+   until a concrete >8-at-one-price clustering scenario justifies it.
 5. **Multi-hop / Jupiter integration** — completely deferred. Routers will need
    a "preview liquidation context" RPC; design when we get there.
 6. **Borrower nonce** — using a per-pool monotonic `next_loan_nonce` keeps loan

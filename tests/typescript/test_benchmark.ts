@@ -16,18 +16,23 @@
  *      bands — the maximum number of band PDAs the on-chain bitmap walk must
  *      load and decrypt in a single instruction. This is the true CU ceiling
  *      of the cascade and the headline assertion.
- *   3. Headroom + projection: asserts the cap-depth worst case clears the
- *      1.4M-CU per-transaction ceiling with comfortable margin, and reports
- *      how many liquidations the marginal cost would in principle allow.
+ *   3. The binding constraint: measures the worst-case swap *transaction size*
+ *      against the 1232-byte legacy limit and shows that — not CU — is what
+ *      caps MAX_LIQ_PER_SWAP. Every liquidated loan + band PDA is a 32-byte
+ *      account key, so the account list fills the transaction long before the
+ *      cascade exhausts the compute budget (CU has ~10x more headroom).
  *
  * All measurements use Token-2022 (heavier token CPI than legacy SPL) so the
  * numbers are the conservative upper bound across both supported token programs.
  */
 
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
+  Transaction,
+  TransactionInstruction,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import { TOKEN_2022_PROGRAM_ID, mintTo } from '@solana/spl-token';
@@ -51,6 +56,14 @@ const TX_CU_CEILING = 1_400_000;
 // the ceiling. Loose enough to absorb compiler/runtime drift, tight enough to
 // catch a real blow-up (e.g. an accidental per-loan quadratic).
 const HEADROOM_FACTOR = 2.0; // worst case must be < CEILING / 2
+
+// The *actual* binding constraint on MAX_LIQ_PER_SWAP. A legacy Solana
+// transaction is capped at 1232 bytes, and every liquidated loan + its band
+// PDA must be passed as a 32-byte account key. CU has ~10x more headroom than
+// this (see the projection test), so the cap is set by account-list size, not
+// compute. Reaching higher caps requires v0 transactions + address lookup
+// tables, not a bigger compute budget.
+const LEGACY_TX_LIMIT = 1232;
 
 const POOL_A = 1_000_000_000n;
 const POOL_B = 4_000_000_000n;
@@ -260,20 +273,72 @@ async function run() {
       `worst case ${cu} keeps ${HEADROOM_FACTOR}x headroom (< ${TX_CU_CEILING / HEADROOM_FACTOR})`);
   });
 
-  // ---------- 3. Projection: how far the marginal cost could scale ----------
+  // ---------- 3. The binding constraint: transaction size, not CU ----------
+  //
+  // CU has enormous headroom (the projection below), so it is NOT what caps
+  // MAX_LIQ_PER_SWAP. The real limit is the 1232-byte legacy transaction: every
+  // liquidated loan + its band PDA is a 32-byte account key in the message. This
+  // test measures the worst-case swap transaction directly and shows the cap of
+  // 8 is sized to that limit — raising it needs v0 + address lookup tables, not
+  // a bigger compute budget.
 
-  await test('Projection: marginal cost leaves the cap well within budget', async () => {
+  // Serialized size (signatures + message) of a legacy swap tx carrying the
+  // given liquidation context. Uses synthetic pubkeys — size depends only on
+  // the account count, not on whether the accounts exist.
+  function swapTxBytes(
+    ctx: Ctx, trader: PublicKey,
+    bands: { bandId: number; loans: PublicKey[] }[],
+  ): number {
+    const ix: TransactionInstruction = ctx.ixSwap(trader, 1n, 1n, true, 0, bands);
+    const tx = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: TX_CU_CEILING }), ix);
+    tx.feePayer = trader;
+    tx.recentBlockhash = '11111111111111111111111111111111'; // 32 zero bytes
+    const msg = tx.compileMessage().serialize();
+    const numSigs = tx.compileMessage().header.numRequiredSignatures;
+    return 1 + 64 * numSigs + msg.length; // sig-count byte + sigs + message
+  }
+
+  await test('Worst-case swap transaction fits the legacy 1232-byte limit', async () => {
+    const ctx = new Ctx(connection, payer, tokenProgram);
+    await ctx.setup(); // derive pool/vault/mint PDAs (no on-chain init needed)
+    const trader = Keypair.generate().publicKey;
+    const fakeLoan = () => Keypair.generate().publicKey;
+
+    // Worst-case layout for account count: each liquidation in its own band, so
+    // every liquidation costs TWO account keys (a band PDA + a loan).
+    const distinctBands = Array.from({ length: MAX_LIQ_PER_SWAP },
+      (_, i) => ({ bandId: i, loans: [fakeLoan()] }));
+
+    const size0 = swapTxBytes(ctx, trader, []);
+    const sizeCap = swapTxBytes(ctx, trader, distinctBands);
+    const perLiq = (sizeCap - size0) / MAX_LIQ_PER_SWAP;
+    const txMax = Math.floor((LEGACY_TX_LIMIT - size0) / perLiq);
+
+    console.log(`    swap tx floor (0 liq):   ${size0} bytes`);
+    console.log(`    swap tx at cap (8 liq):  ${sizeCap} bytes / ${LEGACY_TX_LIMIT} limit`);
+    console.log(`    ~${perLiq.toFixed(0)} bytes per liquidation → legacy tx allows ~${txMax}`);
+
+    assert(sizeCap <= LEGACY_TX_LIMIT,
+      `worst-case cap-depth swap (${sizeCap}B) fits legacy tx (${LEGACY_TX_LIMIT}B)`);
+    // The cap must not exceed what a transaction can actually carry.
+    assert(MAX_LIQ_PER_SWAP <= txMax,
+      `cap ${MAX_LIQ_PER_SWAP} fits the tx-size ceiling (~${txMax})`);
+  });
+
+  await test('Projection: CU is not the binding constraint (tx size is)', async () => {
     const base = cuByDepth.get(0);
     const top = cuByDepth.get(MAX_LIQ_PER_SWAP);
     assert(base !== undefined && top !== undefined, 'sweep endpoints present');
     const marginal = (top! - base!) / MAX_LIQ_PER_SWAP;
-    // Max liquidations the marginal cost would allow before the ceiling, given
-    // the fixed swap floor. Purely informational: it shows the cap of 8 is a
-    // policy choice with large CU margin, not a budget-forced limit.
-    const projectedMax = Math.floor((TX_CU_CEILING - base!) / marginal);
-    console.log(`    cap is ${MAX_LIQ_PER_SWAP}; CU budget alone would allow ~${projectedMax} liquidations`);
-    assert(projectedMax > MAX_LIQ_PER_SWAP,
-      `budget headroom exceeds the cap (projected ${projectedMax} > ${MAX_LIQ_PER_SWAP})`);
+    // Liquidations the CU budget *alone* would allow. This is deliberately NOT a
+    // justification for raising the cap: it far exceeds what a legacy
+    // transaction can carry (previous test), which is the real ceiling. It only
+    // confirms compute is comfortably in surplus at the current cap.
+    const cuMax = Math.floor((TX_CU_CEILING - base!) / marginal);
+    console.log(`    CU budget alone would allow ~${cuMax} liquidations — but tx size caps it far lower`);
+    assert(cuMax > MAX_LIQ_PER_SWAP * 4,
+      `CU is in clear surplus at the cap (projected ${cuMax} >> ${MAX_LIQ_PER_SWAP})`);
   });
 
   console.log(`\n=== Benchmark: ${passed} passed, ${failed} failed ===`);
