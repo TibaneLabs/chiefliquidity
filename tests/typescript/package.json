@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "E2E tests for ChiefLiquidity program",
   "scripts": {
-    "test": "npm run test:functional && npm run test:adversarial",
+    "test": "npm run test:functional && npm run test:adversarial && npm run test:benchmark",
     "test:functional": "npx ts-node --transpile-only test_liquidity.ts",
-    "test:adversarial": "npx ts-node --transpile-only test_adversarial.ts"
+    "test:adversarial": "npx ts-node --transpile-only test_adversarial.ts",
+    "test:benchmark": "npx ts-node --transpile-only test_benchmark.ts"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",

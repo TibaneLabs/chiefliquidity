@@ -529,10 +529,14 @@ Failure modes:
    lets you set up a loan that's instantly underwater but no one swaps to
    trigger it? Probably not, since it'd be opened against the live pool price,
    but worth a note).
-4. **Band scheme** — log2 buckets + bitmap index, shipped. `RebalanceBands` is
-   retired (§6.6). The only remaining (optional) item is a CU benchmark to
-   confirm the log2 base before a finer-granularity migration would ever be
-   warranted.
+4. **Band scheme** — ✅ resolved. log2 buckets + bitmap index, shipped;
+   `RebalanceBands` is retired (§6.6). The CU benchmark is now in place
+   (`tests/typescript/test_benchmark.ts`): the worst-case cascade — 8
+   liquidations across 8 *distinct* bands (max band-PDA loads) — measures
+   ~129k CU, under 10% of the 1.4M per-tx ceiling, at ~9.6k CU marginal per
+   liquidation and ~2.2k CU per extra band PDA. The `MAX_LIQ_PER_SWAP = 8` cap
+   is confirmed to be a policy choice, not a budget limit (the budget alone
+   would allow ~140), so the log2 base needs no change.
 5. **Multi-hop / Jupiter integration** — completely deferred. Routers will need
    a "preview liquidation context" RPC; design when we get there.
 6. **Borrower nonce** — using a per-pool monotonic `next_loan_nonce` keeps loan
@@ -573,8 +577,13 @@ End-to-end tests live in `tests/typescript/` (same layout as
 over RPC, covering every instruction on both token programs plus the
 off-chain router flow (§6.2 — bitmap walk + `getProgramAccounts` band
 enumeration), adversarial completeness attacks, the liquidation / band caps,
-and conservation checks. Run locally via `./scripts/run-e2e-tests.sh`; CI
-runs it on every push (`.github/workflows/verifiable-build.yml`).
+and conservation checks. Three files: `test_liquidity.ts` (functional, both
+token programs + the shared `Ctx` harness), `test_adversarial.ts`
+(account-substitution attacks + the randomized invariant fuzzer), and
+`test_benchmark.ts` (the §6.6 compute-unit benchmark — cascade depth sweep +
+worst-case 8-distinct-band layout, asserting the cascade clears the 1.4M-CU
+per-tx ceiling with margin). Run locally via `./scripts/run-e2e-tests.sh`; CI
+runs all three on every push (`.github/workflows/verifiable-build.yml`).
 
 ---
 
