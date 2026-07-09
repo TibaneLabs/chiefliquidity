@@ -19,11 +19,7 @@ use solana_program::{
     sysvar::Sysvar,
 };
 use spl_token_2022::{
-    extension::{
-        permanent_delegate::PermanentDelegate, transfer_fee::TransferFeeConfig,
-        transfer_hook::TransferHook, BaseStateWithExtensions, ExtensionType,
-        StateWithExtensions,
-    },
+    extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
     state::Mint,
 };
 
@@ -295,9 +291,39 @@ pub fn process_initialize_pool(
 
 // ---- helpers ----
 
-/// Reject Token-2022 mints with extensions that would break vault accounting
-/// or enable theft. SPL Token mints have no extensions, so this is a no-op
-/// for them.
+/// Token-2022 mint extensions the pool can safely custody. This is an
+/// **allowlist**: a mint carrying *any* extension not in this set is rejected,
+/// so unknown / future / dangerous extensions fail closed rather than slipping
+/// through a denylist.
+///
+/// Permitted (none affect transferability or the raw amounts the vaults track):
+///   - `MintCloseAuthority`  — can only close at zero supply, impossible while a
+///     pool holds the token.
+///   - `InterestBearingConfig` — scales only the *UI* amount; raw amounts, and
+///     therefore all vault/AMM accounting, are unchanged.
+///   - metadata extensions (`MetadataPointer`, `TokenMetadata`, and the token
+///     group/member set) — descriptive only.
+///
+/// Deliberately NOT allowed (break accounting, transferability, or enable
+/// theft): `TransferFeeConfig`, `PermanentDelegate`, `TransferHook`,
+/// `ConfidentialTransfer*`, `DefaultAccountState` (could default-freeze the
+/// vault), `NonTransferable`, and anything else.
+///
+/// Note: classic SPL Token mints (USDC, USDT, wSOL, …) have no extensions and
+/// take the early return below, so they are always accepted.
+const MINT_EXTENSION_ALLOWLIST: &[ExtensionType] = &[
+    ExtensionType::MintCloseAuthority,
+    ExtensionType::InterestBearingConfig,
+    ExtensionType::MetadataPointer,
+    ExtensionType::TokenMetadata,
+    ExtensionType::GroupPointer,
+    ExtensionType::TokenGroup,
+    ExtensionType::GroupMemberPointer,
+    ExtensionType::TokenGroupMember,
+];
+
+/// Reject Token-2022 mints carrying any non-allowlisted extension. SPL Token
+/// mints have no extensions, so this is a no-op for them.
 fn validate_mint_extensions(mint_info: &AccountInfo, token_program: &Pubkey) -> ProgramResult {
     if *token_program != spl_token_2022::id() {
         return Ok(());
@@ -305,23 +331,15 @@ fn validate_mint_extensions(mint_info: &AccountInfo, token_program: &Pubkey) -> 
     let data = mint_info.try_borrow_data()?;
     let state = StateWithExtensions::<Mint>::unpack(&data)?;
 
-    if state.get_extension::<TransferFeeConfig>().is_ok() {
-        msg!("mint {} has TransferFee extension — rejected", mint_info.key);
-        return Err(LiquidityError::UnsupportedMintExtension.into());
-    }
-    if state.get_extension::<PermanentDelegate>().is_ok() {
-        msg!(
-            "mint {} has PermanentDelegate extension — rejected",
-            mint_info.key
-        );
-        return Err(LiquidityError::UnsupportedMintExtension.into());
-    }
-    if state.get_extension::<TransferHook>().is_ok() {
-        msg!(
-            "mint {} has TransferHook extension — rejected",
-            mint_info.key
-        );
-        return Err(LiquidityError::UnsupportedMintExtension.into());
+    for ext in state.get_extension_types()? {
+        if !MINT_EXTENSION_ALLOWLIST.contains(&ext) {
+            msg!(
+                "mint {} has non-allowlisted extension {:?} — rejected",
+                mint_info.key,
+                ext
+            );
+            return Err(LiquidityError::UnsupportedMintExtension.into());
+        }
     }
     Ok(())
 }

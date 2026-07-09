@@ -35,6 +35,8 @@ import {
   createMint,
   createInitializeMintInstruction,
   createInitializeTransferFeeConfigInstruction,
+  createInitializeInterestBearingMintInstruction,
+  createInitializeNonTransferableMintInstruction,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -937,37 +939,67 @@ async function runTests() {
     // params to validate. Bounds are checked at compile time in the program.)
 
     if (tokenProgramId.equals(TOKEN_2022_PROGRAM_ID)) {
-      await T('Initialize pool: TransferFee mint rejected', async (ctx) => {
-        // Build a transfer-fee mint lexicographically ordered against mint_b.
-        const feeMintKp = Keypair.generate();
-        const mintLen = getMintLen([ExtensionType.TransferFeeConfig]);
+      // Create a Token-2022 mint carrying `extTypes` (the extension init ixs are
+      // built by `extIxs`, applied before InitializeMint), pair it with the
+      // context's plain mint_b, and return a Ctx ready to initialize that pool.
+      // Both mints are Token-2022, so the pool exercises the extension allowlist.
+      const poolWithExtensionMint = async (
+        ctx: Ctx,
+        extTypes: ExtensionType[],
+        extIxs: (mint: PublicKey) => TransactionInstruction[],
+      ): Promise<Ctx> => {
+        const kp = Keypair.generate();
+        const mintLen = getMintLen(extTypes);
         const rent = await connection.getMinimumBalanceForRentExemption(mintLen);
         const tx = new Transaction().add(
           SystemProgram.createAccount({
-            fromPubkey: payer.publicKey, newAccountPubkey: feeMintKp.publicKey,
+            fromPubkey: payer.publicKey, newAccountPubkey: kp.publicKey,
             space: mintLen, lamports: rent, programId: TOKEN_2022_PROGRAM_ID,
           }),
-          createInitializeTransferFeeConfigInstruction(
-            feeMintKp.publicKey, payer.publicKey, payer.publicKey, 100, 1_000_000n,
-            TOKEN_2022_PROGRAM_ID),
-          createInitializeMintInstruction(feeMintKp.publicKey, 6, payer.publicKey, null,
+          ...extIxs(kp.publicKey),
+          createInitializeMintInstruction(kp.publicKey, 6, payer.publicKey, null,
             TOKEN_2022_PROGRAM_ID),
         );
-        await sendAndConfirmTransaction(connection, tx, [payer, feeMintKp], { commitment: 'confirmed' });
+        await sendAndConfirmTransaction(connection, tx, [payer, kp], { commitment: 'confirmed' });
 
-        const feeMint = feeMintKp.publicKey;
         const [mintA, mintB] =
-          Buffer.compare(feeMint.toBuffer(), ctx.mintB.toBuffer()) < 0
-            ? [feeMint, ctx.mintB] : [ctx.mintB, feeMint];
-        const bad = new Ctx(connection, payer, tokenProgramId);
-        bad.mintA = mintA;
-        bad.mintB = mintB;
-        [bad.pool] = PublicKey.findProgramAddressSync(
+          Buffer.compare(kp.publicKey.toBuffer(), ctx.mintB.toBuffer()) < 0
+            ? [kp.publicKey, ctx.mintB] : [ctx.mintB, kp.publicKey];
+        const pc = new Ctx(connection, payer, tokenProgramId);
+        pc.mintA = mintA;
+        pc.mintB = mintB;
+        [pc.pool] = PublicKey.findProgramAddressSync(
           [POOL_SEED, mintA.toBuffer(), mintB.toBuffer()], PROGRAM_ID);
-        [bad.vaultA] = PublicKey.findProgramAddressSync([VAULT_A_SEED, bad.pool.toBuffer()], PROGRAM_ID);
-        [bad.vaultB] = PublicKey.findProgramAddressSync([VAULT_B_SEED, bad.pool.toBuffer()], PROGRAM_ID);
-        [bad.lpMint] = PublicKey.findProgramAddressSync([LP_MINT_SEED, bad.pool.toBuffer()], PROGRAM_ID);
-        await expectError(bad.initializePool(), Err.UnsupportedMintExtension, 'transfer-fee mint');
+        [pc.vaultA] = PublicKey.findProgramAddressSync([VAULT_A_SEED, pc.pool.toBuffer()], PROGRAM_ID);
+        [pc.vaultB] = PublicKey.findProgramAddressSync([VAULT_B_SEED, pc.pool.toBuffer()], PROGRAM_ID);
+        [pc.lpMint] = PublicKey.findProgramAddressSync([LP_MINT_SEED, pc.pool.toBuffer()], PROGRAM_ID);
+        return pc;
+      };
+
+      await T('Initialize pool: TransferFee mint rejected (not allowlisted)', async (ctx) => {
+        const pc = await poolWithExtensionMint(ctx, [ExtensionType.TransferFeeConfig],
+          (m) => [createInitializeTransferFeeConfigInstruction(
+            m, payer.publicKey, payer.publicKey, 100, 1_000_000n, TOKEN_2022_PROGRAM_ID)]);
+        await expectError(pc.initializePool(), Err.UnsupportedMintExtension, 'transfer-fee mint');
+      });
+
+      await T('Initialize pool: NonTransferable mint rejected (allowlist)', async (ctx) => {
+        // Not in the old three-extension denylist — proves the allowlist is
+        // stricter: anything not explicitly permitted fails closed.
+        const pc = await poolWithExtensionMint(ctx, [ExtensionType.NonTransferable],
+          (m) => [createInitializeNonTransferableMintInstruction(m, TOKEN_2022_PROGRAM_ID)]);
+        await expectError(pc.initializePool(), Err.UnsupportedMintExtension, 'non-transferable mint');
+      });
+
+      await T('Initialize pool: interest-bearing mint accepted (allowlisted)', async (ctx) => {
+        // InterestBearingConfig only scales the UI amount; raw amounts are
+        // unchanged, so it is safe and must be accepted.
+        const pc = await poolWithExtensionMint(ctx, [ExtensionType.InterestBearingConfig],
+          (m) => [createInitializeInterestBearingMintInstruction(
+            m, payer.publicKey, 500, TOKEN_2022_PROGRAM_ID)]);
+        await pc.initializePool();
+        const pool = await pc.poolState();
+        assertEq(pool.swapFeeBps, 30, 'pool created with interest-bearing mint');
       });
     }
 
