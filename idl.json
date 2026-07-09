@@ -1,0 +1,1717 @@
+{
+  "address": "ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw",
+  "metadata": {
+    "name": "chiefliquidity",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "origin": "native",
+    "serialization": "borsh",
+    "description": "Liquidation-aware AMM lending protocol: a single program combining a CPMM AMM with collateralized lending, where liquidation executes inside swap. Supports SPL Token and Token 2022. Instruction discriminators are single-byte Borsh enum variant indexes (NOT Anchor 8-byte sighashes); error codes are the raw ProgramError::Custom index (0-based, NOT Anchor's 6000-based)."
+  },
+  "instructions": [
+    {
+      "name": "initializePool",
+      "discriminator": [
+        0
+      ],
+      "docs": [
+        "Initialize a new (mintA, mintB) pool. Mints must be sorted (mintA < mintB) so the pool PDA is canonical.",
+        "Creates the two vaults and the LP mint; validates that neither mint carries a dangerous Token-2022 extension."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool account (PDA: [\"pool\", mintA, mintB])"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A (PDA: [\"vault_a\", pool])"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B (PDA: [\"vault_b\", pool])"
+          ]
+        },
+        {
+          "name": "lpMint",
+          "writable": true,
+          "docs": [
+            "LP mint (PDA: [\"lp_mint\", pool])"
+          ]
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "Authority / payer"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111",
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111",
+          "docs": [
+            "Rent sysvar"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "swapFeeBps",
+          "type": "u16",
+          "docs": [
+            "Swap fee in bps (max 1000 = 10%)."
+          ]
+        },
+        {
+          "name": "protocolFeeBps",
+          "type": "u16",
+          "docs": [
+            "Protocol's cut of the swap fee, in bps (must be <= swapFeeBps)."
+          ]
+        },
+        {
+          "name": "liqRatioBps",
+          "type": "u16",
+          "docs": [
+            "Liquidation ratio in bps (> 10000; e.g. 11000 = 110%)."
+          ]
+        },
+        {
+          "name": "maxLtvBps",
+          "type": "u16",
+          "docs": [
+            "Max loan-to-value at open, in bps (must stay below BPS^2 / liqRatioBps)."
+          ]
+        },
+        {
+          "name": "interestBaseBpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Base APR (bps) at zero utilization."
+          ]
+        },
+        {
+          "name": "interestSlope1BpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Slope from zero to kink utilization (bps APR added at kink)."
+          ]
+        },
+        {
+          "name": "interestSlope2BpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Slope from kink to 100% utilization (bps APR added over kink)."
+          ]
+        },
+        {
+          "name": "interestKinkBps",
+          "type": "u16",
+          "docs": [
+            "Kink point in bps of utilization (e.g. 8000 = 80%)."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "addLiquidity",
+      "discriminator": [
+        1
+      ],
+      "docs": [
+        "Deposit A and B (or the proportional fraction thereof) and receive LP tokens.",
+        "First deposit mints sqrt(a*b); subsequent deposits mint min(a/A, b/B) * lpSupply and clip the excess side."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "lpMint",
+          "writable": true,
+          "docs": [
+            "LP mint"
+          ]
+        },
+        {
+          "name": "userTokenA",
+          "writable": true,
+          "docs": [
+            "User token account A (source)"
+          ]
+        },
+        {
+          "name": "userTokenB",
+          "writable": true,
+          "docs": [
+            "User token account B (source)"
+          ]
+        },
+        {
+          "name": "userLpToken",
+          "writable": true,
+          "docs": [
+            "User LP token account (destination)"
+          ]
+        },
+        {
+          "name": "user",
+          "signer": true,
+          "docs": [
+            "User"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amountAMax",
+          "type": "u64",
+          "docs": [
+            "Maximum A to deposit."
+          ]
+        },
+        {
+          "name": "amountBMax",
+          "type": "u64",
+          "docs": [
+            "Maximum B to deposit."
+          ]
+        },
+        {
+          "name": "minLpOut",
+          "type": "u64",
+          "docs": [
+            "Minimum LP tokens to accept (slippage guard)."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "removeLiquidity",
+      "discriminator": [
+        2
+      ],
+      "docs": [
+        "Burn LP and receive a proportional share of accounted reserves.",
+        "Reverts if real vault balances cannot cover the withdrawal (e.g. the pool is heavily lent out)."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "lpMint",
+          "writable": true,
+          "docs": [
+            "LP mint"
+          ]
+        },
+        {
+          "name": "userTokenA",
+          "writable": true,
+          "docs": [
+            "User token account A (destination)"
+          ]
+        },
+        {
+          "name": "userTokenB",
+          "writable": true,
+          "docs": [
+            "User token account B (destination)"
+          ]
+        },
+        {
+          "name": "userLpToken",
+          "writable": true,
+          "docs": [
+            "User LP token account (source)"
+          ]
+        },
+        {
+          "name": "user",
+          "signer": true,
+          "docs": [
+            "User"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "lpAmount",
+          "type": "u64",
+          "docs": [
+            "LP tokens to burn."
+          ]
+        },
+        {
+          "name": "minAOut",
+          "type": "u64",
+          "docs": [
+            "Minimum A to accept (slippage guard)."
+          ]
+        },
+        {
+          "name": "minBOut",
+          "type": "u64",
+          "docs": [
+            "Minimum B to accept (slippage guard)."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "openLoan",
+      "discriminator": [
+        3
+      ],
+      "docs": [
+        "Open a collateralized loan. `sides` selects which token is collateral and which is debt.",
+        "The program derives the trigger price and band id from the amounts and liqRatioBps, allocates the band on first use, and increments its membership count.",
+        "LTV check: debtValue / collateralValue <= maxLtvBps at the pool's accounted mid-price. `nonce` must equal pool.nextLoanNonce."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "borrowerTokenA",
+          "writable": true,
+          "docs": [
+            "Borrower's token account A"
+          ]
+        },
+        {
+          "name": "borrowerTokenB",
+          "writable": true,
+          "docs": [
+            "Borrower's token account B"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "Borrower (also rent payer for the new Loan/Band accounts)"
+          ]
+        },
+        {
+          "name": "loan",
+          "writable": true,
+          "docs": [
+            "Loan PDA ([\"loan\", pool, borrower, nonce_le])"
+          ]
+        },
+        {
+          "name": "band",
+          "writable": true,
+          "docs": [
+            "Band PDA ([\"band\", pool, direction, band_id_le])"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111",
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "sides",
+          "type": "u8",
+          "docs": [
+            "0 = CollateralA (deposit A, borrow B; liquidates OnFall). 1 = CollateralB (deposit B, borrow A; liquidates OnRise)."
+          ]
+        },
+        {
+          "name": "collateralAmount",
+          "type": "u64",
+          "docs": [
+            "Collateral deposited (in the collateral side's token)."
+          ]
+        },
+        {
+          "name": "debtAmount",
+          "type": "u64",
+          "docs": [
+            "Debt drawn (in the debt side's token)."
+          ]
+        },
+        {
+          "name": "nonce",
+          "type": "u64",
+          "docs": [
+            "Loan nonce; must equal pool.nextLoanNonce."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "repayLoan",
+      "discriminator": [
+        4
+      ],
+      "docs": [
+        "Repay a loan in full (no partial repay in v1). Transfers principal + accrued interest back into the pool,",
+        "releases the collateral, decrements the band's count (refunding band rent if it empties), and marks the Loan repaid."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "borrowerTokenA",
+          "writable": true,
+          "docs": [
+            "Borrower's token account A"
+          ]
+        },
+        {
+          "name": "borrowerTokenB",
+          "writable": true,
+          "docs": [
+            "Borrower's token account B"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "Borrower"
+          ]
+        },
+        {
+          "name": "loan",
+          "writable": true,
+          "docs": [
+            "Loan"
+          ]
+        },
+        {
+          "name": "band",
+          "writable": true,
+          "docs": [
+            "Band"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claimProtocolFees",
+      "discriminator": [
+        5
+      ],
+      "docs": [
+        "Authority-only: drain accumulated protocol fees from the vaults to the authority's token accounts and reset the counters.",
+        "No-op if both fee counters are already 0. Reverts if the pool authority has been renounced."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "authorityTokenA",
+          "writable": true,
+          "docs": [
+            "Authority's token A account"
+          ]
+        },
+        {
+          "name": "authorityTokenB",
+          "writable": true,
+          "docs": [
+            "Authority's token B account"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Authority"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "transferAuthority",
+      "discriminator": [
+        6
+      ],
+      "docs": [
+        "Authority-only: rotate the pool authority. Set newAuthority = the default/zero pubkey to permanently renounce."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Current authority"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "newAuthority",
+          "type": "pubkey",
+          "docs": [
+            "New authority (zero pubkey = renounce)."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "claimLiquidatedRent",
+      "discriminator": [
+        7
+      ],
+      "docs": [
+        "Borrower-callable: reclaim the rent on a Loan that was liquidated mid-swap (status = LIQUIDATED)."
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "docs": [
+            "Loan (status = LIQUIDATED; drained + zeroed)"
+          ]
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "Borrower (lamport recipient; must match Loan.borrower)"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "updatePoolSettings",
+      "discriminator": [
+        8
+      ],
+      "docs": [
+        "Authority-only: retune fee/liquidation/LTV/interest parameters within the same bounds as initializePool.",
+        "Applies prospectively (existing loans' triggers are not recomputed). Borrow indexes are bumped at the OLD rate first."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "docs": [
+            "Vault A (read-only; needed for utilization)"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "docs": [
+            "Vault B (read-only; needed for utilization)"
+          ]
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Authority"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "swapFeeBps",
+          "type": "u16",
+          "docs": [
+            "Swap fee in bps (max 1000 = 10%)."
+          ]
+        },
+        {
+          "name": "protocolFeeBps",
+          "type": "u16",
+          "docs": [
+            "Protocol's cut of the swap fee, in bps (must be <= swapFeeBps)."
+          ]
+        },
+        {
+          "name": "liqRatioBps",
+          "type": "u16",
+          "docs": [
+            "Liquidation ratio in bps (> 10000; e.g. 11000 = 110%)."
+          ]
+        },
+        {
+          "name": "maxLtvBps",
+          "type": "u16",
+          "docs": [
+            "Max loan-to-value at open, in bps (must stay below BPS^2 / liqRatioBps)."
+          ]
+        },
+        {
+          "name": "interestBaseBpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Base APR (bps) at zero utilization."
+          ]
+        },
+        {
+          "name": "interestSlope1BpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Slope from zero to kink utilization (bps APR added at kink)."
+          ]
+        },
+        {
+          "name": "interestSlope2BpsPerYear",
+          "type": "u16",
+          "docs": [
+            "Slope from kink to 100% utilization (bps APR added over kink)."
+          ]
+        },
+        {
+          "name": "interestKinkBps",
+          "type": "u16",
+          "docs": [
+            "Kink point in bps of utilization (e.g. 8000 = 80%)."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "swap",
+      "discriminator": [
+        9
+      ],
+      "docs": [
+        "Swap with mandatory in-flight liquidation (DESIGN.md \u00a77).",
+        "The caller supplies every band + all of its open loans whose liquidation the price move might trigger. The program iteratively reprices, liquidates the next crossed loan, and repeats, then quotes the swap on the post-liquidation reserves and commits only if min_out and the executable-reserve cap are satisfied.",
+        "Beyond the 9 fixed accounts below, the instruction takes a variable tail: for each entry i in bandLoanCounts, one writable Band PDA followed by bandLoanCounts[i] writable Loan accounts (all of that band's open loans, sorted strictly ascending by pubkey)."
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true,
+          "docs": [
+            "Pool"
+          ]
+        },
+        {
+          "name": "vaultA",
+          "writable": true,
+          "docs": [
+            "Vault A"
+          ]
+        },
+        {
+          "name": "vaultB",
+          "writable": true,
+          "docs": [
+            "Vault B"
+          ]
+        },
+        {
+          "name": "userTokenA",
+          "writable": true,
+          "docs": [
+            "User token A"
+          ]
+        },
+        {
+          "name": "userTokenB",
+          "writable": true,
+          "docs": [
+            "User token B"
+          ]
+        },
+        {
+          "name": "mintA",
+          "docs": [
+            "Mint A"
+          ]
+        },
+        {
+          "name": "mintB",
+          "docs": [
+            "Mint B"
+          ]
+        },
+        {
+          "name": "user",
+          "signer": true,
+          "docs": [
+            "User"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "Token program (SPL Token or Token 2022)"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amountIn",
+          "type": "u64",
+          "docs": [
+            "Input amount."
+          ]
+        },
+        {
+          "name": "minOut",
+          "type": "u64",
+          "docs": [
+            "Minimum output (slippage guard)."
+          ]
+        },
+        {
+          "name": "aToB",
+          "type": "bool",
+          "docs": [
+            "true = swap A for B (price falls, OnFall loans trigger); false = B for A (price rises, OnRise)."
+          ]
+        },
+        {
+          "name": "bandBoundary",
+          "type": "u32",
+          "docs": [
+            "Completeness boundary: for a_to_b, every populated OnFall band with band_id >= this must be supplied; for !a_to_b, every populated OnRise band with band_id <= this must be supplied."
+          ]
+        },
+        {
+          "name": "bandLoanCounts",
+          "type": {
+            "vec": "u8"
+          },
+          "docs": [
+            "Per-band loan count; entry i must equal band i's on-chain membership count."
+          ]
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Pool",
+      "discriminator": [
+        161,
+        196,
+        231,
+        18,
+        59,
+        143,
+        213,
+        110
+      ]
+    },
+    {
+      "name": "Loan",
+      "discriminator": [
+        178,
+        126,
+        60,
+        160,
+        145,
+        77,
+        142,
+        85
+      ]
+    },
+    {
+      "name": "LoanIndexBand",
+      "discriminator": [
+        212,
+        149,
+        58,
+        113,
+        104,
+        46,
+        193,
+        136
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "Pool",
+      "docs": [
+        "Per-pool state. PDA: [\"pool\", mintA, mintB] with mintA < mintB. Size: 434 bytes.",
+        "accounted_x = (real_x - total_collateral_x) + total_debt_x; real_x lives in the vault SPL account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "discriminator",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            },
+            "docs": [
+              "Account-type discriminator (random sentinel, not Anchor-derived)."
+            ]
+          },
+          {
+            "name": "mintA",
+            "type": "pubkey",
+            "docs": [
+              "Token A mint."
+            ]
+          },
+          {
+            "name": "mintB",
+            "type": "pubkey",
+            "docs": [
+              "Token B mint."
+            ]
+          },
+          {
+            "name": "vaultA",
+            "type": "pubkey",
+            "docs": [
+              "Vault holding real A."
+            ]
+          },
+          {
+            "name": "vaultB",
+            "type": "pubkey",
+            "docs": [
+              "Vault holding real B."
+            ]
+          },
+          {
+            "name": "lpMint",
+            "type": "pubkey",
+            "docs": [
+              "LP mint."
+            ]
+          },
+          {
+            "name": "authority",
+            "type": "pubkey",
+            "docs": [
+              "Pool authority (zero = renounced)."
+            ]
+          },
+          {
+            "name": "poolBump",
+            "type": "u8",
+            "docs": [
+              "Pool PDA bump."
+            ]
+          },
+          {
+            "name": "vaultABump",
+            "type": "u8",
+            "docs": [
+              "Vault A PDA bump."
+            ]
+          },
+          {
+            "name": "vaultBBump",
+            "type": "u8",
+            "docs": [
+              "Vault B PDA bump."
+            ]
+          },
+          {
+            "name": "lpMintBump",
+            "type": "u8",
+            "docs": [
+              "LP mint PDA bump."
+            ]
+          },
+          {
+            "name": "totalDebtA",
+            "type": "u128",
+            "docs": [
+              "Total A currently borrowed."
+            ]
+          },
+          {
+            "name": "totalDebtB",
+            "type": "u128",
+            "docs": [
+              "Total B currently borrowed."
+            ]
+          },
+          {
+            "name": "totalCollateralA",
+            "type": "u128",
+            "docs": [
+              "Total A held as collateral."
+            ]
+          },
+          {
+            "name": "totalCollateralB",
+            "type": "u128",
+            "docs": [
+              "Total B held as collateral."
+            ]
+          },
+          {
+            "name": "curveKind",
+            "type": "u8",
+            "docs": [
+              "0 = CPMM."
+            ]
+          },
+          {
+            "name": "swapFeeBps",
+            "type": "u16",
+            "docs": [
+              "Swap fee (bps)."
+            ]
+          },
+          {
+            "name": "protocolFeeBps",
+            "type": "u16",
+            "docs": [
+              "Protocol cut of the swap fee (bps)."
+            ]
+          },
+          {
+            "name": "curvePad",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            },
+            "docs": [
+              "Padding."
+            ]
+          },
+          {
+            "name": "liqRatioBps",
+            "type": "u16",
+            "docs": [
+              "Liquidation ratio (bps)."
+            ]
+          },
+          {
+            "name": "maxLtvBps",
+            "type": "u16",
+            "docs": [
+              "Max LTV at open (bps)."
+            ]
+          },
+          {
+            "name": "lendingPad",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            },
+            "docs": [
+              "Padding."
+            ]
+          },
+          {
+            "name": "interestBaseBpsPerYear",
+            "type": "u16",
+            "docs": [
+              "Base APR (bps)."
+            ]
+          },
+          {
+            "name": "interestSlope1BpsPerYear",
+            "type": "u16",
+            "docs": [
+              "Slope 1 (bps)."
+            ]
+          },
+          {
+            "name": "interestSlope2BpsPerYear",
+            "type": "u16",
+            "docs": [
+              "Slope 2 (bps)."
+            ]
+          },
+          {
+            "name": "interestKinkBps",
+            "type": "u16",
+            "docs": [
+              "Utilization kink (bps)."
+            ]
+          },
+          {
+            "name": "borrowIndexAWad",
+            "type": "u128",
+            "docs": [
+              "Monotonic borrow index for A debt (WAD, >= WAD)."
+            ]
+          },
+          {
+            "name": "borrowIndexBWad",
+            "type": "u128",
+            "docs": [
+              "Monotonic borrow index for B debt (WAD, >= WAD)."
+            ]
+          },
+          {
+            "name": "lastIndexUpdateSlot",
+            "type": "u64",
+            "docs": [
+              "Slot both indexes were last bumped."
+            ]
+          },
+          {
+            "name": "openLoans",
+            "type": "u64",
+            "docs": [
+              "Count of currently open loans."
+            ]
+          },
+          {
+            "name": "nextLoanNonce",
+            "type": "u64",
+            "docs": [
+              "Next loan nonce to assign."
+            ]
+          },
+          {
+            "name": "lastUpdateSlot",
+            "type": "u64",
+            "docs": [
+              "Slot of last pool mutation."
+            ]
+          },
+          {
+            "name": "protocolFeesA",
+            "type": "u64",
+            "docs": [
+              "Unclaimed protocol fees in A."
+            ]
+          },
+          {
+            "name": "protocolFeesB",
+            "type": "u64",
+            "docs": [
+              "Unclaimed protocol fees in B."
+            ]
+          },
+          {
+            "name": "bandBitmapFall",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            },
+            "docs": [
+              "128-bit bitmap of populated OnFall bands."
+            ]
+          },
+          {
+            "name": "bandBitmapRise",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            },
+            "docs": [
+              "128-bit bitmap of populated OnRise bands."
+            ]
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            },
+            "docs": [
+              "Reserved."
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Loan",
+      "docs": [
+        "Per-position loan state. PDA: [\"loan\", pool, borrower, nonce_le]. Size: 210 bytes."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "discriminator",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            },
+            "docs": [
+              "Account-type discriminator (random sentinel, not Anchor-derived)."
+            ]
+          },
+          {
+            "name": "pool",
+            "type": "pubkey",
+            "docs": [
+              "Pool this loan belongs to."
+            ]
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey",
+            "docs": [
+              "Borrower / rent payer."
+            ]
+          },
+          {
+            "name": "nonce",
+            "type": "u64",
+            "docs": [
+              "Per-borrower loan nonce."
+            ]
+          },
+          {
+            "name": "bump",
+            "type": "u8",
+            "docs": [
+              "Loan PDA bump."
+            ]
+          },
+          {
+            "name": "sides",
+            "type": "u8",
+            "docs": [
+              "0 = CollateralA (debt B), 1 = CollateralB (debt A)."
+            ]
+          },
+          {
+            "name": "collateralAmount",
+            "type": "u128",
+            "docs": [
+              "Collateral held."
+            ]
+          },
+          {
+            "name": "debtPrincipal",
+            "type": "u128",
+            "docs": [
+              "Debt principal (interest tracked via index)."
+            ]
+          },
+          {
+            "name": "borrowIndexSnapshotWad",
+            "type": "u128",
+            "docs": [
+              "Pool borrow index for the debt side at open/last touch (WAD)."
+            ]
+          },
+          {
+            "name": "lastTouchSlot",
+            "type": "u64",
+            "docs": [
+              "Slot accrual was last realized (informational)."
+            ]
+          },
+          {
+            "name": "triggerPriceWad",
+            "type": "u128",
+            "docs": [
+              "B-per-A trigger price (WAD)."
+            ]
+          },
+          {
+            "name": "triggerDirection",
+            "type": "u8",
+            "docs": [
+              "0 = OnFall, 1 = OnRise."
+            ]
+          },
+          {
+            "name": "status",
+            "type": "u8",
+            "docs": [
+              "0 = open, 1 = repaid, 2 = liquidated."
+            ]
+          },
+          {
+            "name": "statusPad",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            },
+            "docs": [
+              "Padding."
+            ]
+          },
+          {
+            "name": "bandId",
+            "type": "u32",
+            "docs": [
+              "band_id_for_trigger(triggerPriceWad); set once at open."
+            ]
+          },
+          {
+            "name": "openedSlot",
+            "type": "u64",
+            "docs": [
+              "Slot opened."
+            ]
+          },
+          {
+            "name": "closedSlot",
+            "type": "u64",
+            "docs": [
+              "Slot closed (repay/liquidation)."
+            ]
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                28
+              ]
+            },
+            "docs": [
+              "Reserved."
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "LoanIndexBand",
+      "docs": [
+        "Membership counter for one (pool, direction, band_id) bucket. PDA: [\"band\", pool, direction_byte, band_id_le]. Size: 88 bytes.",
+        "Stores only how many open loans fall in its 2x price bucket (max 64), not which ones."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "discriminator",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            },
+            "docs": [
+              "Account-type discriminator (random sentinel, not Anchor-derived)."
+            ]
+          },
+          {
+            "name": "pool",
+            "type": "pubkey",
+            "docs": [
+              "Pool this band belongs to."
+            ]
+          },
+          {
+            "name": "bandId",
+            "type": "u32",
+            "docs": [
+              "Band id (log2 price bucket)."
+            ]
+          },
+          {
+            "name": "direction",
+            "type": "u8",
+            "docs": [
+              "0 = OnFall, 1 = OnRise."
+            ]
+          },
+          {
+            "name": "bump",
+            "type": "u8",
+            "docs": [
+              "Band PDA bump."
+            ]
+          },
+          {
+            "name": "pad",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            },
+            "docs": [
+              "Padding."
+            ]
+          },
+          {
+            "name": "count",
+            "type": "u32",
+            "docs": [
+              "Open loans in this band (0..64)."
+            ]
+          },
+          {
+            "name": "pad2",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            },
+            "docs": [
+              "Padding."
+            ]
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            },
+            "docs": [
+              "Reserved."
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 0,
+      "name": "InvalidInstruction",
+      "msg": "Invalid instruction data"
+    },
+    {
+      "code": 1,
+      "name": "AlreadyInitialized",
+      "msg": "Account already initialized"
+    },
+    {
+      "code": 2,
+      "name": "NotInitialized",
+      "msg": "Account not initialized"
+    },
+    {
+      "code": 3,
+      "name": "InvalidPDA",
+      "msg": "Invalid PDA"
+    },
+    {
+      "code": 4,
+      "name": "AccountDataTooSmall",
+      "msg": "Account data too small"
+    },
+    {
+      "code": 5,
+      "name": "InvalidAccountOwner",
+      "msg": "Invalid account owner"
+    },
+    {
+      "code": 6,
+      "name": "MissingRequiredSigner",
+      "msg": "Missing required signer"
+    },
+    {
+      "code": 7,
+      "name": "MissingSystemProgram",
+      "msg": "System program required"
+    },
+    {
+      "code": 8,
+      "name": "AuthorityRenounced",
+      "msg": "Authority has been renounced"
+    },
+    {
+      "code": 9,
+      "name": "InvalidAuthority",
+      "msg": "Invalid authority"
+    },
+    {
+      "code": 10,
+      "name": "InvalidPool",
+      "msg": "Invalid pool"
+    },
+    {
+      "code": 11,
+      "name": "InvalidPoolMint",
+      "msg": "Invalid pool mint"
+    },
+    {
+      "code": 12,
+      "name": "InvalidVault",
+      "msg": "Invalid vault"
+    },
+    {
+      "code": 13,
+      "name": "InvalidLpMint",
+      "msg": "Invalid LP mint"
+    },
+    {
+      "code": 14,
+      "name": "InvalidTokenProgram",
+      "msg": "Invalid token program"
+    },
+    {
+      "code": 15,
+      "name": "InvalidMintProgram",
+      "msg": "Invalid mint - must be Token or Token 2022"
+    },
+    {
+      "code": 16,
+      "name": "UnsupportedMintExtension",
+      "msg": "Token mint has a dangerous extension (PermanentDelegate, TransferHook, TransferFee)"
+    },
+    {
+      "code": 17,
+      "name": "MintsMustDiffer",
+      "msg": "Mint A and Mint B must differ"
+    },
+    {
+      "code": 18,
+      "name": "MintsNotSorted",
+      "msg": "Mint A must compare lexicographically less than Mint B"
+    },
+    {
+      "code": 19,
+      "name": "SettingExceedsMaximum",
+      "msg": "Setting value exceeds maximum allowed"
+    },
+    {
+      "code": 20,
+      "name": "InvalidCurveKind",
+      "msg": "Invalid curve kind"
+    },
+    {
+      "code": 21,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 22,
+      "name": "MathUnderflow",
+      "msg": "Math underflow"
+    },
+    {
+      "code": 23,
+      "name": "ZeroAmount",
+      "msg": "Zero amount not allowed"
+    },
+    {
+      "code": 24,
+      "name": "ZeroReserves",
+      "msg": "Reserves are zero or pool not seeded"
+    },
+    {
+      "code": 25,
+      "name": "SlippageExceeded",
+      "msg": "Slippage exceeded - output below user min_out"
+    },
+    {
+      "code": 26,
+      "name": "InsufficientExecutableLiquidity",
+      "msg": "Insufficient executable liquidity to satisfy swap"
+    },
+    {
+      "code": 27,
+      "name": "LtvExceedsMax",
+      "msg": "Loan-to-value ratio exceeds maximum allowed"
+    },
+    {
+      "code": 28,
+      "name": "LoanNotOpen",
+      "msg": "Loan is not in an open state"
+    },
+    {
+      "code": 29,
+      "name": "LoanNotLiquidatable",
+      "msg": "Loan is not currently liquidatable at supplied price"
+    },
+    {
+      "code": 30,
+      "name": "InvalidSidesEncoding",
+      "msg": "Invalid sides encoding for loan"
+    },
+    {
+      "code": 31,
+      "name": "DebtRemainsAfterRepay",
+      "msg": "Debt remains after repay - cannot close loan"
+    },
+    {
+      "code": 32,
+      "name": "InvalidLiquidationContext",
+      "msg": "Invalid liquidation context - account ordering or band mismatch"
+    },
+    {
+      "code": 33,
+      "name": "LinkChainBroken",
+      "msg": "Loan-link chain inconsistency - prev/next pointer mismatch"
+    },
+    {
+      "code": 34,
+      "name": "IncompleteBandWalk",
+      "msg": "Crossed band must supply all of its links - chain is incomplete"
+    },
+    {
+      "code": 35,
+      "name": "SentinelMissing",
+      "msg": "Sentinel link's trigger price does not bound the swap path"
+    },
+    {
+      "code": 36,
+      "name": "BandMismatch",
+      "msg": "Band PDA does not match supplied (pool, direction, band_id)"
+    },
+    {
+      "code": 37,
+      "name": "BandFull",
+      "msg": "Band has reached its capacity - no more loans can open in this price bucket"
+    },
+    {
+      "code": 38,
+      "name": "TooManyLiquidationsRequired",
+      "msg": "Swap would require more liquidations than the per-tx cap permits"
+    },
+    {
+      "code": 39,
+      "name": "Insolvent",
+      "msg": "Pool is insolvent post-liquidation - real reserves cannot cover output"
+    }
+  ]
+}
