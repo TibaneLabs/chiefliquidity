@@ -29,6 +29,13 @@ pub enum LiquidityInstruction {
     /// Initialize a new (mint_a, mint_b) pool. Mints must be sorted; the
     /// program enforces `mint_a < mint_b` so the pool PDA is canonical.
     ///
+    /// Pools are **immutable and authority-less**: every economic parameter
+    /// (fees, liquidation ratio, max LTV, interest curve) is a fixed program
+    /// constant (see `initialize_pool.rs`), the pool's `authority` is set to
+    /// `Pubkey::default()`, and there is no instruction to change any of it.
+    /// The instruction therefore takes **no arguments**; the creator gains no
+    /// special rights.
+    ///
     /// Accounts:
     /// 0. `[writable]` Pool account (PDA: ["pool", mint_a, mint_b])
     /// 1. `[]` Mint A
@@ -36,24 +43,11 @@ pub enum LiquidityInstruction {
     /// 3. `[writable]` Vault A (PDA: ["vault_a", pool])
     /// 4. `[writable]` Vault B (PDA: ["vault_b", pool])
     /// 5. `[writable]` LP mint (PDA: ["lp_mint", pool])
-    /// 6. `[writable, signer]` Authority/payer
+    /// 6. `[writable, signer]` Payer (funds rent only; NOT recorded as authority)
     /// 7. `[]` System program
     /// 8. `[]` Token program
     /// 9. `[]` Rent sysvar
-    InitializePool {
-        swap_fee_bps: u16,
-        protocol_fee_bps: u16,
-        liq_ratio_bps: u16,
-        max_ltv_bps: u16,
-        /// Base APR (bps) at zero utilization.
-        interest_base_bps_per_year: u16,
-        /// Slope from zero to kink utilization (bps APR added at kink).
-        interest_slope1_bps_per_year: u16,
-        /// Slope from kink to 100% utilization (bps APR added over kink).
-        interest_slope2_bps_per_year: u16,
-        /// Kink point in bps of utilization (e.g. 8000 = 80%).
-        interest_kink_bps: u16,
-    },
+    InitializePool,
 
     /// Deposit `amount_a_max` of A and `amount_b_max` of B (or proportional
     /// fraction thereof) and receive LP tokens.
@@ -152,31 +146,28 @@ pub enum LiquidityInstruction {
     /// 10. `[]`        Token program
     RepayLoan,
 
-    /// Authority-only: drain accumulated protocol fees from the vaults to
-    /// the authority's token accounts. Resets `protocol_fees_a` and
-    /// `protocol_fees_b` to 0. No-op if both are already 0.
+    /// Drain accumulated protocol fees from the vaults to the caller's token
+    /// accounts. Resets `protocol_fees_a` / `protocol_fees_b` to 0; no-op if
+    /// both are already 0.
     ///
-    /// Reverts if pool authority has been renounced.
+    /// Gated on the **program's upgrade authority** (not a pool authority —
+    /// pools have none): the signer must equal the `upgrade_authority_address`
+    /// recorded in the program's ProgramData account. This ties fee redemption
+    /// to whoever controls the program, and follows automatically if the
+    /// upgrade authority is transferred.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
     /// 1. `[writable]` Vault A
     /// 2. `[writable]` Vault B
-    /// 3. `[writable]` Authority's token A account
-    /// 4. `[writable]` Authority's token B account
+    /// 3. `[writable]` Recipient token A account
+    /// 4. `[writable]` Recipient token B account
     /// 5. `[]`         Mint A
     /// 6. `[]`         Mint B
-    /// 7. `[signer]`   Authority
-    /// 8. `[]`         Token program
+    /// 7. `[signer]`   Program upgrade authority (fee recipient)
+    /// 8. `[]`         Program ProgramData account (source of the upgrade authority)
+    /// 9. `[]`         Token program
     ClaimProtocolFees,
-
-    /// Authority-only: rotate the pool authority. Set `new_authority =
-    /// Pubkey::default()` to permanently renounce.
-    ///
-    /// Accounts:
-    /// 0. `[writable]` Pool
-    /// 1. `[signer]`   Current authority
-    TransferAuthority { new_authority: Pubkey },
 
     /// Borrower-callable: reclaim the rent on a `Loan` that was liquidated
     /// mid-swap.
@@ -186,29 +177,6 @@ pub enum LiquidityInstruction {
     /// 1. `[writable, signer]` Borrower (lamport recipient; must match
     ///    `Loan.borrower`)
     ClaimLiquidatedRent,
-
-    /// Authority-only: retune fee/liquidation/LTV/interest parameters
-    /// within the same bounds as `InitializePool`. Applies prospectively
-    /// (existing loans' trigger prices are not recomputed). The borrow
-    /// indexes are bumped at the **old** rate before the new params take
-    /// effect, so accrued-but-unrealized interest is captured at the
-    /// previous curve.
-    ///
-    /// Accounts:
-    /// 0. `[writable]` Pool
-    /// 1. `[]` Vault A (read-only — needed for utilization)
-    /// 2. `[]` Vault B (read-only)
-    /// 3. `[signer]`   Authority
-    UpdatePoolSettings {
-        swap_fee_bps: u16,
-        protocol_fee_bps: u16,
-        liq_ratio_bps: u16,
-        max_ltv_bps: u16,
-        interest_base_bps_per_year: u16,
-        interest_slope1_bps_per_year: u16,
-        interest_slope2_bps_per_year: u16,
-        interest_kink_bps: u16,
-    },
 
     /// Swap with mandatory in-flight liquidation. See DESIGN.md §7.
     ///
@@ -285,29 +253,9 @@ pub fn process_instruction(
         .map_err(|_| ProgramError::InvalidInstructionData)?;
 
     match instruction {
-        LiquidityInstruction::InitializePool {
-            swap_fee_bps,
-            protocol_fee_bps,
-            liq_ratio_bps,
-            max_ltv_bps,
-            interest_base_bps_per_year,
-            interest_slope1_bps_per_year,
-            interest_slope2_bps_per_year,
-            interest_kink_bps,
-        } => {
+        LiquidityInstruction::InitializePool => {
             msg!("Instruction: InitializePool");
-            process_initialize_pool(
-                program_id,
-                accounts,
-                swap_fee_bps,
-                protocol_fee_bps,
-                liq_ratio_bps,
-                max_ltv_bps,
-                interest_base_bps_per_year,
-                interest_slope1_bps_per_year,
-                interest_slope2_bps_per_year,
-                interest_kink_bps,
-            )
+            process_initialize_pool(program_id, accounts)
         }
         LiquidityInstruction::AddLiquidity {
             amount_a_max,
@@ -361,37 +309,9 @@ pub fn process_instruction(
             msg!("Instruction: ClaimProtocolFees");
             process_claim_protocol_fees(program_id, accounts)
         }
-        LiquidityInstruction::TransferAuthority { new_authority } => {
-            msg!("Instruction: TransferAuthority");
-            process_transfer_authority(program_id, accounts, new_authority)
-        }
         LiquidityInstruction::ClaimLiquidatedRent => {
             msg!("Instruction: ClaimLiquidatedRent");
             process_claim_liquidated_rent(program_id, accounts)
-        }
-        LiquidityInstruction::UpdatePoolSettings {
-            swap_fee_bps,
-            protocol_fee_bps,
-            liq_ratio_bps,
-            max_ltv_bps,
-            interest_base_bps_per_year,
-            interest_slope1_bps_per_year,
-            interest_slope2_bps_per_year,
-            interest_kink_bps,
-        } => {
-            msg!("Instruction: UpdatePoolSettings");
-            process_update_pool_settings(
-                program_id,
-                accounts,
-                swap_fee_bps,
-                protocol_fee_bps,
-                liq_ratio_bps,
-                max_ltv_bps,
-                interest_base_bps_per_year,
-                interest_slope1_bps_per_year,
-                interest_slope2_bps_per_year,
-                interest_kink_bps,
-            )
         }
         LiquidityInstruction::Swap {
             amount_in,

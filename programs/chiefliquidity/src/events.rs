@@ -170,19 +170,6 @@ impl_event!(
     [0xe8, 0x26, 0x53, 0xca, 0x7c, 0x91, 0x0e, 0xbf]
 );
 
-/// The pool authority was rotated or renounced. Emitted by `TransferAuthority`.
-/// `new_authority == Pubkey::default()` signals a permanent renounce.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct AuthorityTransferred {
-    pub pool: Pubkey,
-    pub old_authority: Pubkey,
-    pub new_authority: Pubkey,
-}
-impl_event!(
-    AuthorityTransferred,
-    [0xe9, 0x3a, 0xd7, 0x84, 0x1b, 0x6f, 0xc2, 0x50]
-);
-
 /// A liquidated borrower reclaimed the rent on their tombstoned loan. Emitted
 /// by `ClaimLiquidatedRent`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -194,24 +181,6 @@ pub struct LiquidatedRentClaimed {
 impl_event!(
     LiquidatedRentClaimed,
     [0xea, 0x5c, 0x08, 0x93, 0xe1, 0x47, 0xba, 0x2d]
-);
-
-/// Pool parameters were retuned. Emitted by `UpdatePoolSettings`.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PoolSettingsUpdated {
-    pub pool: Pubkey,
-    pub swap_fee_bps: u16,
-    pub protocol_fee_bps: u16,
-    pub liq_ratio_bps: u16,
-    pub max_ltv_bps: u16,
-    pub interest_base_bps_per_year: u16,
-    pub interest_slope1_bps_per_year: u16,
-    pub interest_slope2_bps_per_year: u16,
-    pub interest_kink_bps: u16,
-}
-impl_event!(
-    PoolSettingsUpdated,
-    [0xeb, 0x7e, 0x31, 0xa5, 0x4f, 0xd0, 0x68, 0x9b]
 );
 
 #[cfg(test)]
@@ -307,26 +276,10 @@ mod tests {
             amount_a: 10,
             amount_b: 20,
         });
-        assert_wire_format(&AuthorityTransferred {
-            pool: Pubkey::new_unique(),
-            old_authority: Pubkey::new_unique(),
-            new_authority: Pubkey::default(),
-        });
         assert_wire_format(&LiquidatedRentClaimed {
             pool: Pubkey::new_unique(),
             loan: Pubkey::new_unique(),
             borrower: Pubkey::new_unique(),
-        });
-        assert_wire_format(&PoolSettingsUpdated {
-            pool: Pubkey::new_unique(),
-            swap_fee_bps: 25,
-            protocol_fee_bps: 5,
-            liq_ratio_bps: 12_000,
-            max_ltv_bps: 7_500,
-            interest_base_bps_per_year: 100,
-            interest_slope1_bps_per_year: 300,
-            interest_slope2_bps_per_year: 5_000,
-            interest_kink_bps: 8_500,
         });
     }
 
@@ -343,9 +296,7 @@ mod tests {
             LoanLiquidated::DISCRIMINATOR,
             SwapExecuted::DISCRIMINATOR,
             ProtocolFeesClaimed::DISCRIMINATOR,
-            AuthorityTransferred::DISCRIMINATOR,
             LiquidatedRentClaimed::DISCRIMINATOR,
-            PoolSettingsUpdated::DISCRIMINATOR,
         ];
         for (i, a) in discs.iter().enumerate() {
             assert_eq!(a[0] & 0xf0, 0xe0, "event disc must lead with 0xe_");

@@ -22,6 +22,7 @@ use solana_program::{
 };
 use solana_program_test::{processor, BanksClient, ProgramTest, ProgramTestBanksClientExt};
 use solana_sdk::{
+    account::Account,
     commitment_config::CommitmentLevel,
     hash::Hash,
     signature::{Keypair, Signer},
@@ -76,6 +77,10 @@ pub struct TestEnv {
     pub mint_a_decimals: u8,
     pub mint_b_decimals: u8,
     pub token_program: Pubkey,
+    /// The program's simulated upgrade authority — seeded into an injected
+    /// ProgramData account (see `new`). This is the only key that can claim
+    /// protocol fees (pools are authority-less).
+    pub upgrade_authority: Keypair,
     /// Every loan ever opened via `open_loan`, as `(loan_pda, band_id,
     /// direction)`. A superset of the currently-open set — `swap_full` filters
     /// it by on-chain `is_open` status, so repaid/liquidated loans drop out
@@ -99,6 +104,31 @@ impl TestEnv {
             "spl_token_2022",
             spl_token_2022::id(),
             processor!(spl_token_2022::processor::Processor::process),
+        );
+
+        // ClaimProtocolFees is gated on the program's upgrade authority, read
+        // from the ProgramData account. `ProgramTest` loads programs under the
+        // non-upgradeable loader (no ProgramData), so inject a canonical
+        // ProgramData account with a known upgrade authority we control.
+        let upgrade_authority = Keypair::new();
+        let (program_data_addr, _) = Pubkey::find_program_address(
+            &[program_id.as_ref()],
+            &solana_program::bpf_loader_upgradeable::id(),
+        );
+        // UpgradeableLoaderState::ProgramData: u32 tag(3) | u64 slot | Option<Pubkey>.
+        let mut pd_data = vec![0u8; 45];
+        pd_data[0..4].copy_from_slice(&3u32.to_le_bytes());
+        pd_data[12] = 1; // Some(upgrade_authority)
+        pd_data[13..45].copy_from_slice(upgrade_authority.pubkey().as_ref());
+        program_test.add_account(
+            program_data_addr,
+            Account {
+                lamports: 1_000_000_000,
+                data: pd_data,
+                owner: solana_program::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
         );
 
         let (mut banks_client, payer, last_blockhash) = program_test.start().await;
@@ -145,6 +175,7 @@ impl TestEnv {
             mint_a_decimals,
             mint_b_decimals,
             token_program,
+            upgrade_authority,
             opened_loans: Vec::new(),
         }
     }
@@ -266,21 +297,15 @@ impl TestEnv {
 
     // ---- Pool initialization ----
 
-    pub fn ix_initialize_pool(&self, params: &PoolParams) -> Instruction {
+    /// Pools are immutable/authority-less: `InitializePool` takes no args. The
+    /// `_params` argument is retained so existing call sites compile, but the
+    /// pool always gets the fixed program constants regardless of what's passed.
+    pub fn ix_initialize_pool(&self, _params: &PoolParams) -> Instruction {
         let pool = self.pool_pda().0;
         let vault_a = self.vault_a_pda().0;
         let vault_b = self.vault_b_pda().0;
         let lp_mint = self.lp_mint_pda().0;
-        let data = LiquidityInstruction::InitializePool {
-            swap_fee_bps: params.swap_fee_bps,
-            protocol_fee_bps: params.protocol_fee_bps,
-            liq_ratio_bps: params.liq_ratio_bps,
-            max_ltv_bps: params.max_ltv_bps,
-            interest_base_bps_per_year: params.interest_base_bps_per_year,
-            interest_slope1_bps_per_year: params.interest_slope1_bps_per_year,
-            interest_slope2_bps_per_year: params.interest_slope2_bps_per_year,
-            interest_kink_bps: params.interest_kink_bps,
-        };
+        let data = LiquidityInstruction::InitializePool;
         Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -654,50 +679,15 @@ impl TestEnv {
 
     // ---- Admin helpers ----
 
-    pub async fn transfer_authority(
-        &mut self,
-        authority: &Keypair,
-        new_authority: Pubkey,
-    ) -> Result<(), TransportError> {
-        let data = LiquidityInstruction::TransferAuthority { new_authority };
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(self.pool_pda().0, false),
-                AccountMeta::new_readonly(authority.pubkey(), true),
-            ],
-            data: borsh::to_vec(&data).unwrap(),
-        };
-        self.send_with_new_blockhash(&[ix], &[authority]).await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_pool_settings(
-        &mut self,
-        authority: &Keypair,
-        params: &PoolParams,
-    ) -> Result<(), TransportError> {
-        let data = LiquidityInstruction::UpdatePoolSettings {
-            swap_fee_bps: params.swap_fee_bps,
-            protocol_fee_bps: params.protocol_fee_bps,
-            liq_ratio_bps: params.liq_ratio_bps,
-            max_ltv_bps: params.max_ltv_bps,
-            interest_base_bps_per_year: params.interest_base_bps_per_year,
-            interest_slope1_bps_per_year: params.interest_slope1_bps_per_year,
-            interest_slope2_bps_per_year: params.interest_slope2_bps_per_year,
-            interest_kink_bps: params.interest_kink_bps,
-        };
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(self.pool_pda().0, false),
-                AccountMeta::new_readonly(self.vault_a_pda().0, false),
-                AccountMeta::new_readonly(self.vault_b_pda().0, false),
-                AccountMeta::new_readonly(authority.pubkey(), true),
-            ],
-            data: borsh::to_vec(&data).unwrap(),
-        };
-        self.send_with_new_blockhash(&[ix], &[authority]).await
+    /// Canonical ProgramData PDA for our program under the upgradeable loader.
+    /// The test harness seeds this account (see `new`) with `payer` as the
+    /// upgrade authority, so `payer` is the protocol-fee claimant.
+    pub fn program_data_pda(&self) -> Pubkey {
+        Pubkey::find_program_address(
+            &[self.program_id.as_ref()],
+            &solana_program::bpf_loader_upgradeable::id(),
+        )
+        .0
     }
 
     pub async fn claim_protocol_fees(
@@ -718,6 +708,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_a.pubkey(), false),
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
                 AccountMeta::new_readonly(authority.pubkey(), true),
+                AccountMeta::new_readonly(self.program_data_pda(), false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),

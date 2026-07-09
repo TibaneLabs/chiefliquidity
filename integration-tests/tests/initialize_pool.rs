@@ -4,6 +4,10 @@ mod common;
 
 use chiefliquidity::{
     error::LiquidityError,
+    instructions::initialize_pool::{
+        INTEREST_BASE_BPS_PER_YEAR, INTEREST_KINK_BPS, INTEREST_SLOPE1_BPS_PER_YEAR,
+        INTEREST_SLOPE2_BPS_PER_YEAR, LIQ_RATIO_BPS, MAX_LTV_BPS, PROTOCOL_FEE_BPS, SWAP_FEE_BPS,
+    },
     math::WAD,
     state::POOL_DISCRIMINATOR,
     LiquidityInstruction,
@@ -30,7 +34,18 @@ async fn happy_path_creates_all_pdas_and_persists_pool() {
     assert_eq!(pool.vault_a, env.vault_a_pda().0);
     assert_eq!(pool.vault_b, env.vault_b_pda().0);
     assert_eq!(pool.lp_mint, env.lp_mint_pda().0);
-    assert_eq!(pool.authority, env.payer.pubkey());
+    // Pools are authority-less: the creator gains no rights.
+    assert_eq!(pool.authority, solana_program::pubkey::Pubkey::default());
+
+    // Economics are the fixed program constants, not creator-chosen.
+    assert_eq!(pool.swap_fee_bps, SWAP_FEE_BPS);
+    assert_eq!(pool.protocol_fee_bps, PROTOCOL_FEE_BPS);
+    assert_eq!(pool.liq_ratio_bps, LIQ_RATIO_BPS);
+    assert_eq!(pool.max_ltv_bps, MAX_LTV_BPS);
+    assert_eq!(pool.interest_base_bps_per_year, INTEREST_BASE_BPS_PER_YEAR);
+    assert_eq!(pool.interest_slope1_bps_per_year, INTEREST_SLOPE1_BPS_PER_YEAR);
+    assert_eq!(pool.interest_slope2_bps_per_year, INTEREST_SLOPE2_BPS_PER_YEAR);
+    assert_eq!(pool.interest_kink_bps, INTEREST_KINK_BPS);
 
     // Reserves and counters at zero
     assert_eq!(pool.total_debt_a, 0);
@@ -95,22 +110,12 @@ async fn rejects_reinitialize() {
 async fn rejects_unsorted_mints() {
     // Build the instruction by hand with mint_a/mint_b deliberately swapped.
     let mut env = TestEnv::new().await;
-    let params = PoolParams::default();
 
     let pool = env.pool_pda().0;
     let vault_a = env.vault_a_pda().0;
     let vault_b = env.vault_b_pda().0;
     let lp_mint = env.lp_mint_pda().0;
-    let data = LiquidityInstruction::InitializePool {
-        swap_fee_bps: params.swap_fee_bps,
-        protocol_fee_bps: params.protocol_fee_bps,
-        liq_ratio_bps: params.liq_ratio_bps,
-        max_ltv_bps: params.max_ltv_bps,
-        interest_base_bps_per_year: params.interest_base_bps_per_year,
-        interest_slope1_bps_per_year: params.interest_slope1_bps_per_year,
-        interest_slope2_bps_per_year: params.interest_slope2_bps_per_year,
-        interest_kink_bps: params.interest_kink_bps,
-    };
+    let data = LiquidityInstruction::InitializePool;
     // Pass mint_b first, mint_a second — should be rejected.
     let ix = Instruction {
         program_id: env.program_id,
@@ -140,81 +145,6 @@ async fn rejects_unsorted_mints() {
     );
 }
 
-#[tokio::test]
-async fn rejects_swap_fee_above_max() {
-    let mut env = TestEnv::new().await;
-    let mut p = PoolParams::default();
-    p.swap_fee_bps = 5_000; // 50% > MAX_SWAP_FEE_BPS = 10%
-    let ix = env.ix_initialize_pool(&p);
-    let err = env.send(&[ix], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
-
-#[tokio::test]
-async fn rejects_protocol_fee_above_swap_fee() {
-    let mut env = TestEnv::new().await;
-    let mut p = PoolParams::default();
-    p.swap_fee_bps = 30;
-    p.protocol_fee_bps = 50; // > swap fee
-    let ix = env.ix_initialize_pool(&p);
-    let err = env.send(&[ix], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
-
-#[tokio::test]
-async fn rejects_liq_ratio_below_min() {
-    let mut env = TestEnv::new().await;
-    let mut p = PoolParams::default();
-    p.liq_ratio_bps = 9_000; // < MIN 10100
-    let ix = env.ix_initialize_pool(&p);
-    let err = env.send(&[ix], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
-
-#[tokio::test]
-async fn rejects_max_ltv_unsafe_vs_liq_ratio() {
-    let mut env = TestEnv::new().await;
-    let mut p = PoolParams::default();
-    // max_ltv must be < BPS_DENOM^2 / liq_ratio. With liq_ratio=11000,
-    // upper bound = 100_000_000 / 11_000 ≈ 9090. Pick 9500 → reject.
-    p.liq_ratio_bps = 11_000;
-    p.max_ltv_bps = 9_500;
-    let ix = env.ix_initialize_pool(&p);
-    let err = env.send(&[ix], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
-
-#[tokio::test]
-async fn rejects_kink_at_zero_or_full() {
-    let mut env = TestEnv::new().await;
-    let mut p = PoolParams::default();
-    p.interest_kink_bps = 0;
-    let ix = env.ix_initialize_pool(&p);
-    let err = env.send(&[ix], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-
-    let mut env2 = TestEnv::new().await;
-    let mut p2 = PoolParams::default();
-    p2.interest_kink_bps = 10_000; // 100% — must be < MAX_KINK_BPS
-    let ix2 = env2.ix_initialize_pool(&p2);
-    let err2 = env2.send(&[ix2], &[]).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err2),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
+// Parameter-bounds tests were removed: pool economics are fixed program
+// constants baked in by InitializePool (validated at compile time in
+// initialize_pool.rs), so there are no caller-supplied params to reject.

@@ -1,148 +1,18 @@
-//! Admin instruction tests + cross-cutting abuse scenarios.
+//! Protocol-fee redemption tests (gated on the program upgrade authority) +
+//! cross-cutting abuse scenarios.
+//!
+//! Pools are immutable and authority-less — there is no TransferAuthority or
+//! UpdatePoolSettings anymore, so those tests are gone. Fee redemption is
+//! gated on the program's upgrade authority, which the harness seeds into an
+//! injected ProgramData account as `env.upgrade_authority`.
 
 mod common;
 
 use chiefliquidity::error::LiquidityError;
-use common::{err_code, extract_custom_error, PoolParams, TestEnv};
-use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
+use common::{err_code, extract_custom_error, TestEnv};
+use solana_sdk::signature::Signer;
 
-// ============ TransferAuthority ============
-
-#[tokio::test]
-async fn transfer_authority_happy() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-
-    let new_auth = Keypair::new();
-    // Payer is the current authority (set by initialize_pool).
-    // Need to clone payer because env.payer is borrowed by send.
-    let payer_clone = env.payer.insecure_clone();
-    env.transfer_authority(&payer_clone, new_auth.pubkey())
-        .await
-        .unwrap();
-
-    let pool = env.pool_state().await;
-    assert_eq!(pool.authority, new_auth.pubkey());
-    assert!(!pool.is_authority_renounced());
-}
-
-#[tokio::test]
-async fn transfer_authority_non_authority_rejected() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-
-    let attacker = env.create_funded_user(10_000_000_000).await;
-    let err = env
-        .transfer_authority(&attacker, attacker.pubkey())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::InvalidAuthority))
-    );
-
-    // Authority unchanged
-    let pool = env.pool_state().await;
-    assert_eq!(pool.authority, env.payer.pubkey());
-}
-
-#[tokio::test]
-async fn transfer_authority_renounce_then_blocked() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-
-    let payer = env.payer.insecure_clone();
-    env.transfer_authority(&payer, Pubkey::default())
-        .await
-        .unwrap();
-
-    let pool = env.pool_state().await;
-    assert!(pool.is_authority_renounced());
-
-    // Try to transfer again — renounced.
-    let err = env
-        .transfer_authority(&payer, payer.pubkey())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::AuthorityRenounced))
-    );
-}
-
-// ============ UpdatePoolSettings ============
-
-#[tokio::test]
-async fn update_pool_settings_happy() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-    let payer = env.payer.insecure_clone();
-
-    let mut new_params = PoolParams::default();
-    new_params.swap_fee_bps = 50; // change from 30 → 50
-    new_params.interest_kink_bps = 9000; // change from 8000 → 9000
-    env.update_pool_settings(&payer, &new_params).await.unwrap();
-
-    let pool = env.pool_state().await;
-    assert_eq!(pool.swap_fee_bps, 50);
-    assert_eq!(pool.interest_kink_bps, 9000);
-}
-
-#[tokio::test]
-async fn update_pool_settings_non_authority_rejected() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-
-    let attacker = env.create_funded_user(10_000_000_000).await;
-    let mut params = PoolParams::default();
-    params.swap_fee_bps = 999;
-    let err = env
-        .update_pool_settings(&attacker, &params)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::InvalidAuthority))
-    );
-}
-
-#[tokio::test]
-async fn update_pool_settings_bad_params_rejected() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-    let payer = env.payer.insecure_clone();
-
-    let mut params = PoolParams::default();
-    params.swap_fee_bps = 5_000; // 50% > MAX 10%
-    let err = env.update_pool_settings(&payer, &params).await.unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::SettingExceedsMaximum))
-    );
-}
-
-#[tokio::test]
-async fn update_after_renounce_rejected() {
-    let mut env = TestEnv::new().await;
-    env.initialize_pool_default().await;
-    let payer = env.payer.insecure_clone();
-
-    env.transfer_authority(&payer, Pubkey::default())
-        .await
-        .unwrap();
-
-    let err = env
-        .update_pool_settings(&payer, &PoolParams::default())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::AuthorityRenounced))
-    );
-}
-
-// ============ ClaimProtocolFees ============
+// ============ ClaimProtocolFees (program-upgrade-authority gated) ============
 
 #[tokio::test]
 async fn claim_protocol_fees_happy() {
@@ -161,15 +31,15 @@ async fn claim_protocol_fees_happy() {
     assert!(pool.protocol_fees_a > 0);
     let expected_a = pool.protocol_fees_a;
 
-    // Authority claims.
-    let payer = env.payer.insecure_clone();
-    let dest_a = env.create_ata(&payer.pubkey(), &env.mint_a.pubkey()).await;
-    let dest_b = env.create_ata(&payer.pubkey(), &env.mint_b.pubkey()).await;
-    env.claim_protocol_fees(&payer, &dest_a, &dest_b)
+    // The program's upgrade authority (not any pool authority) claims.
+    let auth = env.upgrade_authority.insecure_clone();
+    let dest_a = env.create_ata(&auth.pubkey(), &env.mint_a.pubkey()).await;
+    let dest_b = env.create_ata(&auth.pubkey(), &env.mint_b.pubkey()).await;
+    env.claim_protocol_fees(&auth, &dest_a, &dest_b)
         .await
         .unwrap();
 
-    // Tokens landed in authority's accounts.
+    // Tokens landed in the upgrade authority's accounts.
     assert_eq!(env.token_balance(&dest_a).await, expected_a);
     assert_eq!(env.token_balance(&dest_b).await, 0);
 
@@ -180,7 +50,7 @@ async fn claim_protocol_fees_happy() {
 }
 
 #[tokio::test]
-async fn claim_protocol_fees_non_authority_rejected() {
+async fn claim_protocol_fees_non_upgrade_authority_rejected() {
     let mut env = TestEnv::new().await;
     let _ = env
         .setup_pool_with_liquidity(1_000_000_000, 4_000_000_000)
@@ -190,6 +60,8 @@ async fn claim_protocol_fees_non_authority_rejected() {
         .await
         .unwrap();
 
+    // Anyone who is not the program upgrade authority is rejected — including
+    // the pool creator / fee payer (pools grant no authority).
     let attacker = env.create_funded_user(10_000_000_000).await;
     let dest_a = env.create_ata(&attacker.pubkey(), &env.mint_a.pubkey()).await;
     let dest_b = env.create_ata(&attacker.pubkey(), &env.mint_b.pubkey()).await;
@@ -200,29 +72,6 @@ async fn claim_protocol_fees_non_authority_rejected() {
     assert_eq!(
         extract_custom_error(&err),
         Some(err_code(LiquidityError::InvalidAuthority))
-    );
-}
-
-#[tokio::test]
-async fn claim_protocol_fees_after_renounce_rejected() {
-    let mut env = TestEnv::new().await;
-    let _ = env
-        .setup_pool_with_liquidity(1_000_000_000, 4_000_000_000)
-        .await;
-    let payer = env.payer.insecure_clone();
-    env.transfer_authority(&payer, Pubkey::default())
-        .await
-        .unwrap();
-
-    let dest_a = env.create_ata(&payer.pubkey(), &env.mint_a.pubkey()).await;
-    let dest_b = env.create_ata(&payer.pubkey(), &env.mint_b.pubkey()).await;
-    let err = env
-        .claim_protocol_fees(&payer, &dest_a, &dest_b)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        extract_custom_error(&err),
-        Some(err_code(LiquidityError::AuthorityRenounced))
     );
 }
 

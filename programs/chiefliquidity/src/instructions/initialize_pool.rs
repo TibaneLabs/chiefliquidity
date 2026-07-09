@@ -40,19 +40,36 @@ use crate::{
 /// Decimals for the pool's LP token mint. Fixed at 9 (SOL convention).
 pub const LP_MINT_DECIMALS: u8 = 9;
 
-// ---- Parameter bounds ----
+// ---- Fixed pool economics (immutable; every pool gets exactly these) ----
+//
+// Pools are authority-less and non-configurable: these constants ARE the pool
+// parameters. `InitializePool` bakes them in and there is no instruction to
+// change them afterward. The compile-time asserts below reproduce the safety
+// bounds the old runtime `validate_params` enforced, so an unsafe edit fails
+// `cargo build` instead of shipping a broken pool.
 
-pub const MIN_LIQ_RATIO_BPS: u16 = 10_100; // 101%
-pub const MAX_LIQ_RATIO_BPS: u16 = 30_000; // 300%
-pub const MAX_SWAP_FEE_BPS: u16 = 1_000; // 10%
-pub const MIN_LTV_BPS: u16 = 100; // 1%
+pub const SWAP_FEE_BPS: u16 = 30; // 0.30%
+pub const PROTOCOL_FEE_BPS: u16 = 5; // protocol's cut of the swap fee (of the 30)
+pub const LIQ_RATIO_BPS: u16 = 11_000; // 110%
+pub const MAX_LTV_BPS: u16 = 8_000; // 80%
+pub const INTEREST_BASE_BPS_PER_YEAR: u16 = 0; // base APR at zero utilization
+pub const INTEREST_SLOPE1_BPS_PER_YEAR: u16 = 400; // +4% APR by the kink
+pub const INTEREST_SLOPE2_BPS_PER_YEAR: u16 = 30_000; // +300% APR over the kink
+pub const INTEREST_KINK_BPS: u16 = 8_000; // kink at 80% utilization
 
-// Interest model bounds (all in bps-per-year, except kink which is bps of utilization).
-pub const MAX_INTEREST_BASE_BPS: u16 = 10_000; // 100% APR base
-pub const MAX_INTEREST_SLOPE1_BPS: u16 = 10_000; // 100% APR at kink
-pub const MAX_INTEREST_SLOPE2_BPS: u16 = 65_000; // ~650% APR over kink
-pub const MIN_KINK_BPS: u16 = 100; // 1% utilization
-pub const MAX_KINK_BPS: u16 = 9_900; // 99% utilization
+const _: () = {
+    assert!(SWAP_FEE_BPS <= 1_000); // fee <= 10%
+    assert!(PROTOCOL_FEE_BPS <= SWAP_FEE_BPS); // protocol cut <= swap fee
+    assert!(LIQ_RATIO_BPS >= 10_100 && LIQ_RATIO_BPS <= 30_000); // 101%..=300%
+    assert!(MAX_LTV_BPS >= 100); // >= 1%
+    // Loans must open strictly below the liquidation threshold:
+    //   max_ltv < BPS_DENOM^2 / liq_ratio
+    assert!((MAX_LTV_BPS as u128) * (LIQ_RATIO_BPS as u128) < BPS_DENOM * BPS_DENOM);
+    assert!(INTEREST_BASE_BPS_PER_YEAR <= 10_000);
+    assert!(INTEREST_SLOPE1_BPS_PER_YEAR <= 10_000);
+    assert!(INTEREST_SLOPE2_BPS_PER_YEAR <= 65_000);
+    assert!(INTEREST_KINK_BPS >= 100 && INTEREST_KINK_BPS <= 9_900); // 1%..=99%
+};
 
 /// Initialize a new liquidity pool.
 ///
@@ -67,18 +84,9 @@ pub const MAX_KINK_BPS: u16 = 9_900; // 99% utilization
 /// 7. `[]`        System program
 /// 8. `[]`        Token program (SPL Token or Token 2022)
 /// 9. `[]`        Rent sysvar
-#[allow(clippy::too_many_arguments)]
 pub fn process_initialize_pool(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    swap_fee_bps: u16,
-    protocol_fee_bps: u16,
-    liq_ratio_bps: u16,
-    max_ltv_bps: u16,
-    interest_base_bps_per_year: u16,
-    interest_slope1_bps_per_year: u16,
-    interest_slope2_bps_per_year: u16,
-    interest_kink_bps: u16,
 ) -> ProgramResult {
     let it = &mut accounts.iter();
 
@@ -118,19 +126,6 @@ pub fn process_initialize_pool(
 
     validate_mint_extensions(mint_a_info, token_program_info.key)?;
     validate_mint_extensions(mint_b_info, token_program_info.key)?;
-
-    // ---- Parameter bounds ----
-
-    validate_params(
-        swap_fee_bps,
-        protocol_fee_bps,
-        liq_ratio_bps,
-        max_ltv_bps,
-        interest_base_bps_per_year,
-        interest_slope1_bps_per_year,
-        interest_slope2_bps_per_year,
-        interest_kink_bps,
-    )?;
 
     // ---- PDA derivations ----
 
@@ -237,7 +232,9 @@ pub fn process_initialize_pool(
         vault_a: *vault_a_info.key,
         vault_b: *vault_b_info.key,
         lp_mint: *lp_mint_info.key,
-        authority: *authority_info.key,
+        // Authority-less: no one can retune, drain via a pool authority, or
+        // rotate. Fee redemption is gated on the program upgrade authority.
+        authority: Pubkey::default(),
         pool_bump,
         vault_a_bump,
         vault_b_bump,
@@ -247,16 +244,16 @@ pub fn process_initialize_pool(
         total_collateral_a: 0,
         total_collateral_b: 0,
         curve_kind: CurveKind::Cpmm as u8,
-        swap_fee_bps,
-        protocol_fee_bps,
+        swap_fee_bps: SWAP_FEE_BPS,
+        protocol_fee_bps: PROTOCOL_FEE_BPS,
         _curve_pad: [0; 3],
-        liq_ratio_bps,
-        max_ltv_bps,
+        liq_ratio_bps: LIQ_RATIO_BPS,
+        max_ltv_bps: MAX_LTV_BPS,
         _lending_pad: [0; 2],
-        interest_base_bps_per_year,
-        interest_slope1_bps_per_year,
-        interest_slope2_bps_per_year,
-        interest_kink_bps,
+        interest_base_bps_per_year: INTEREST_BASE_BPS_PER_YEAR,
+        interest_slope1_bps_per_year: INTEREST_SLOPE1_BPS_PER_YEAR,
+        interest_slope2_bps_per_year: INTEREST_SLOPE2_BPS_PER_YEAR,
+        interest_kink_bps: INTEREST_KINK_BPS,
         borrow_index_a_wad: crate::math::WAD,
         borrow_index_b_wad: crate::math::WAD,
         last_index_update_slot: clock.slot,
@@ -282,68 +279,21 @@ pub fn process_initialize_pool(
         pool: *pool_info.key,
         mint_a: *mint_a_info.key,
         mint_b: *mint_b_info.key,
-        authority: *authority_info.key,
-        swap_fee_bps,
-        protocol_fee_bps,
-        liq_ratio_bps,
-        max_ltv_bps,
-        interest_base_bps_per_year,
-        interest_slope1_bps_per_year,
-        interest_slope2_bps_per_year,
-        interest_kink_bps,
+        authority: Pubkey::default(),
+        swap_fee_bps: SWAP_FEE_BPS,
+        protocol_fee_bps: PROTOCOL_FEE_BPS,
+        liq_ratio_bps: LIQ_RATIO_BPS,
+        max_ltv_bps: MAX_LTV_BPS,
+        interest_base_bps_per_year: INTEREST_BASE_BPS_PER_YEAR,
+        interest_slope1_bps_per_year: INTEREST_SLOPE1_BPS_PER_YEAR,
+        interest_slope2_bps_per_year: INTEREST_SLOPE2_BPS_PER_YEAR,
+        interest_kink_bps: INTEREST_KINK_BPS,
     }
     .emit();
     Ok(())
 }
 
 // ---- helpers ----
-
-#[allow(clippy::too_many_arguments)]
-pub fn validate_params(
-    swap_fee_bps: u16,
-    protocol_fee_bps: u16,
-    liq_ratio_bps: u16,
-    max_ltv_bps: u16,
-    interest_base_bps_per_year: u16,
-    interest_slope1_bps_per_year: u16,
-    interest_slope2_bps_per_year: u16,
-    interest_kink_bps: u16,
-) -> ProgramResult {
-    if swap_fee_bps > MAX_SWAP_FEE_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if protocol_fee_bps > swap_fee_bps {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if !(MIN_LIQ_RATIO_BPS..=MAX_LIQ_RATIO_BPS).contains(&liq_ratio_bps) {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if max_ltv_bps < MIN_LTV_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    // Loans must open below the liquidation threshold:
-    //   collateral / debt > liq_ratio   ⇒   debt/collateral < 1/liq_ratio
-    //   max_ltv < BPS_DENOM^2 / liq_ratio
-    let max_safe_ltv = (BPS_DENOM * BPS_DENOM) / liq_ratio_bps as u128;
-    if (max_ltv_bps as u128) >= max_safe_ltv {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-
-    // Interest model bounds
-    if interest_base_bps_per_year > MAX_INTEREST_BASE_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if interest_slope1_bps_per_year > MAX_INTEREST_SLOPE1_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if interest_slope2_bps_per_year > MAX_INTEREST_SLOPE2_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    if !(MIN_KINK_BPS..=MAX_KINK_BPS).contains(&interest_kink_bps) {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
-    Ok(())
-}
 
 /// Reject Token-2022 mints with extensions that would break vault accounting
 /// or enable theft. SPL Token mints have no extensions, so this is a no-op

@@ -1,9 +1,11 @@
-//! Authority-only: drain accumulated protocol fees from the vaults to the
-//! authority's token accounts.
+//! Drain accumulated protocol fees to the caller. Gated on the program's
+//! upgrade authority (read from the ProgramData account) — pools themselves
+//! have no authority.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
+    bpf_loader_upgradeable,
     clock::Clock,
     entrypoint::ProgramResult,
     msg,
@@ -33,6 +35,7 @@ pub fn process_claim_protocol_fees(
     let mint_a_info = next_account_info(it)?;
     let mint_b_info = next_account_info(it)?;
     let authority_info = next_account_info(it)?;
+    let program_data_info = next_account_info(it)?;
     let token_program_info = next_account_info(it)?;
 
     if !authority_info.is_signer {
@@ -45,18 +48,45 @@ pub fn process_claim_protocol_fees(
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
 
+    // Gate on the program's UPGRADE authority (pools have no authority of their
+    // own). The ProgramData account for this program records the upgrade
+    // authority; the signer must equal it. Verify the passed account is the
+    // canonical ProgramData PDA and owned by the upgradeable loader first, so a
+    // spoofed account can't grant access.
+    let (expected_program_data, _) =
+        Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::id());
+    if *program_data_info.key != expected_program_data
+        || *program_data_info.owner != bpf_loader_upgradeable::id()
+    {
+        return Err(LiquidityError::InvalidAccountOwner.into());
+    }
+    // UpgradeableLoaderState::ProgramData bincode layout:
+    //   [0..4]   u32 enum tag (== 3 for ProgramData)
+    //   [4..12]  u64 last-deployed slot
+    //   [12]     Option tag (1 = Some(upgrade_authority))
+    //   [13..45] Pubkey upgrade_authority (present iff tag == 1)
+    {
+        let pd = program_data_info.try_borrow_data()?;
+        if pd.len() < 45 || u32::from_le_bytes([pd[0], pd[1], pd[2], pd[3]]) != 3 {
+            return Err(LiquidityError::InvalidAccountOwner.into());
+        }
+        if pd[12] != 1 {
+            // Upgrade authority renounced → program is immutable → no claimant.
+            return Err(LiquidityError::AuthorityRenounced.into());
+        }
+        let upgrade_authority =
+            Pubkey::try_from(&pd[13..45]).map_err(|_| LiquidityError::InvalidAccountOwner)?;
+        if upgrade_authority != *authority_info.key {
+            return Err(LiquidityError::InvalidAuthority.into());
+        }
+    }
+
     let mut pool = {
         let data = pool_info.try_borrow_data()?;
         Pool::try_from_slice(&data).map_err(|_| LiquidityError::AccountDataTooSmall)?
     };
     if !pool.is_initialized() {
         return Err(LiquidityError::NotInitialized.into());
-    }
-    if pool.is_authority_renounced() {
-        return Err(LiquidityError::AuthorityRenounced.into());
-    }
-    if pool.authority != *authority_info.key {
-        return Err(LiquidityError::InvalidAuthority.into());
     }
     if pool.vault_a != *vault_a_info.key
         || pool.vault_b != *vault_b_info.key

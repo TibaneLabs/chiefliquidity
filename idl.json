@@ -16,7 +16,8 @@
       ],
       "docs": [
         "Initialize a new (mintA, mintB) pool. Mints must be sorted (mintA < mintB) so the pool PDA is canonical.",
-        "Creates the two vaults and the LP mint; validates that neither mint carries a dangerous Token-2022 extension."
+        "Creates the two vaults and the LP mint; validates that neither mint carries a dangerous Token-2022 extension.",
+        "Pools are IMMUTABLE and AUTHORITY-LESS: all economics (fees, liq ratio, LTV, interest curve) are fixed program constants and the pool authority is set to the zero pubkey. Takes no arguments; the creator gains no rights."
       ],
       "accounts": [
         {
@@ -60,11 +61,11 @@
           ]
         },
         {
-          "name": "authority",
+          "name": "payer",
           "writable": true,
           "signer": true,
           "docs": [
-            "Authority / payer"
+            "Payer (funds rent only; NOT recorded as an authority)"
           ]
         },
         {
@@ -88,64 +89,7 @@
           ]
         }
       ],
-      "args": [
-        {
-          "name": "swapFeeBps",
-          "type": "u16",
-          "docs": [
-            "Swap fee in bps (max 1000 = 10%)."
-          ]
-        },
-        {
-          "name": "protocolFeeBps",
-          "type": "u16",
-          "docs": [
-            "Protocol's cut of the swap fee, in bps (must be <= swapFeeBps)."
-          ]
-        },
-        {
-          "name": "liqRatioBps",
-          "type": "u16",
-          "docs": [
-            "Liquidation ratio in bps (> 10000; e.g. 11000 = 110%)."
-          ]
-        },
-        {
-          "name": "maxLtvBps",
-          "type": "u16",
-          "docs": [
-            "Max loan-to-value at open, in bps (must stay below BPS^2 / liqRatioBps)."
-          ]
-        },
-        {
-          "name": "interestBaseBpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Base APR (bps) at zero utilization."
-          ]
-        },
-        {
-          "name": "interestSlope1BpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Slope from zero to kink utilization (bps APR added at kink)."
-          ]
-        },
-        {
-          "name": "interestSlope2BpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Slope from kink to 100% utilization (bps APR added over kink)."
-          ]
-        },
-        {
-          "name": "interestKinkBps",
-          "type": "u16",
-          "docs": [
-            "Kink point in bps of utilization (e.g. 8000 = 80%)."
-          ]
-        }
-      ]
+      "args": []
     },
     {
       "name": "addLiquidity",
@@ -584,8 +528,8 @@
         5
       ],
       "docs": [
-        "Authority-only: drain accumulated protocol fees from the vaults to the authority's token accounts and reset the counters.",
-        "No-op if both fee counters are already 0. Reverts if the pool authority has been renounced."
+        "Drain accumulated protocol fees from the vaults to the caller's token accounts and reset the counters. No-op if both fee counters are already 0.",
+        "Gated on the PROGRAM'S UPGRADE AUTHORITY (pools have none): the signer must equal the upgrade_authority_address in the program's ProgramData account. Reverts if the program is immutable (upgrade authority renounced)."
       ],
       "accounts": [
         {
@@ -610,17 +554,17 @@
           ]
         },
         {
-          "name": "authorityTokenA",
+          "name": "recipientTokenA",
           "writable": true,
           "docs": [
-            "Authority's token A account"
+            "Recipient token A account"
           ]
         },
         {
-          "name": "authorityTokenB",
+          "name": "recipientTokenB",
           "writable": true,
           "docs": [
-            "Authority's token B account"
+            "Recipient token B account"
           ]
         },
         {
@@ -636,10 +580,16 @@
           ]
         },
         {
-          "name": "authority",
+          "name": "upgradeAuthority",
           "signer": true,
           "docs": [
-            "Authority"
+            "Program upgrade authority (fee recipient)"
+          ]
+        },
+        {
+          "name": "programData",
+          "docs": [
+            "Program ProgramData account (source of the upgrade authority)"
           ]
         },
         {
@@ -652,43 +602,9 @@
       "args": []
     },
     {
-      "name": "transferAuthority",
-      "discriminator": [
-        6
-      ],
-      "docs": [
-        "Authority-only: rotate the pool authority. Set newAuthority = the default/zero pubkey to permanently renounce."
-      ],
-      "accounts": [
-        {
-          "name": "pool",
-          "writable": true,
-          "docs": [
-            "Pool"
-          ]
-        },
-        {
-          "name": "authority",
-          "signer": true,
-          "docs": [
-            "Current authority"
-          ]
-        }
-      ],
-      "args": [
-        {
-          "name": "newAuthority",
-          "type": "pubkey",
-          "docs": [
-            "New authority (zero pubkey = renounce)."
-          ]
-        }
-      ]
-    },
-    {
       "name": "claimLiquidatedRent",
       "discriminator": [
-        7
+        6
       ],
       "docs": [
         "Borrower-callable: reclaim the rent on a Loan that was liquidated mid-swap (status = LIQUIDATED)."
@@ -713,105 +629,9 @@
       "args": []
     },
     {
-      "name": "updatePoolSettings",
-      "discriminator": [
-        8
-      ],
-      "docs": [
-        "Authority-only: retune fee/liquidation/LTV/interest parameters within the same bounds as initializePool.",
-        "Applies prospectively (existing loans' triggers are not recomputed). Borrow indexes are bumped at the OLD rate first."
-      ],
-      "accounts": [
-        {
-          "name": "pool",
-          "writable": true,
-          "docs": [
-            "Pool"
-          ]
-        },
-        {
-          "name": "vaultA",
-          "docs": [
-            "Vault A (read-only; needed for utilization)"
-          ]
-        },
-        {
-          "name": "vaultB",
-          "docs": [
-            "Vault B (read-only; needed for utilization)"
-          ]
-        },
-        {
-          "name": "authority",
-          "signer": true,
-          "docs": [
-            "Authority"
-          ]
-        }
-      ],
-      "args": [
-        {
-          "name": "swapFeeBps",
-          "type": "u16",
-          "docs": [
-            "Swap fee in bps (max 1000 = 10%)."
-          ]
-        },
-        {
-          "name": "protocolFeeBps",
-          "type": "u16",
-          "docs": [
-            "Protocol's cut of the swap fee, in bps (must be <= swapFeeBps)."
-          ]
-        },
-        {
-          "name": "liqRatioBps",
-          "type": "u16",
-          "docs": [
-            "Liquidation ratio in bps (> 10000; e.g. 11000 = 110%)."
-          ]
-        },
-        {
-          "name": "maxLtvBps",
-          "type": "u16",
-          "docs": [
-            "Max loan-to-value at open, in bps (must stay below BPS^2 / liqRatioBps)."
-          ]
-        },
-        {
-          "name": "interestBaseBpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Base APR (bps) at zero utilization."
-          ]
-        },
-        {
-          "name": "interestSlope1BpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Slope from zero to kink utilization (bps APR added at kink)."
-          ]
-        },
-        {
-          "name": "interestSlope2BpsPerYear",
-          "type": "u16",
-          "docs": [
-            "Slope from kink to 100% utilization (bps APR added over kink)."
-          ]
-        },
-        {
-          "name": "interestKinkBps",
-          "type": "u16",
-          "docs": [
-            "Kink point in bps of utilization (e.g. 8000 = 80%)."
-          ]
-        }
-      ]
-    },
-    {
       "name": "swap",
       "discriminator": [
-        9
+        7
       ],
       "docs": [
         "Swap with mandatory in-flight liquidation (DESIGN.md \u00a77).",

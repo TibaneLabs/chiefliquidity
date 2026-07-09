@@ -37,6 +37,7 @@ import {
   createInitializeTransferFeeConfigInstruction,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
+  createAssociatedTokenAccountIdempotentInstruction,
   getAccount,
   getMint,
   getMintLen,
@@ -44,6 +45,19 @@ import {
   ExtensionType,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
+import * as fs from 'fs';
+import * as os from 'os';
+
+/**
+ * Load the program's upgrade-authority keypair (the ClaimProtocolFees claimant).
+ * On the local validator the program is deployed with `~/.config/solana/id.json`
+ * as upgrade authority (see scripts/run-e2e-tests.sh).
+ */
+function loadUpgradeAuthority(): Keypair {
+  const path = `${os.homedir()}/.config/solana/id.json`;
+  const secret = Uint8Array.from(JSON.parse(fs.readFileSync(path, 'utf8')));
+  return Keypair.fromSecretKey(secret);
+}
 
 // ===== Program constants (must match programs/chiefliquidity/src) =====
 
@@ -91,11 +105,15 @@ enum Ix {
   OpenLoan = 3,
   RepayLoan = 4,
   ClaimProtocolFees = 5,
-  TransferAuthority = 6,
-  ClaimLiquidatedRent = 7,
-  UpdatePoolSettings = 8,
-  Swap = 9,
+  ClaimLiquidatedRent = 6,
+  Swap = 7,
 }
+
+// BPF upgradeable loader — owns the ProgramData account that records the
+// program's upgrade authority (the ClaimProtocolFees claimant).
+const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+const [PROGRAM_DATA_ADDRESS] = PublicKey.findProgramAddressSync(
+  [PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE);
 
 // LiquidityError discriminants (error.rs order — append-only ABI)
 enum Err {
@@ -479,7 +497,9 @@ class Ctx {
         { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
         { pubkey: new PublicKey('SysvarRent111111111111111111111111111111111'), isSigner: false, isWritable: false },
       ],
-      data: encodeParams(Ix.InitializePool, params),
+      // Pools are immutable/authority-less: InitializePool takes no args.
+      // `params` is accepted for call-site compatibility but ignored.
+      data: Buffer.from([Ix.InitializePool]),
     });
   }
 
@@ -714,8 +734,14 @@ class Ctx {
     return this.swapRaw(user, amountIn, minOut, aToB, boundary, bands);
   }
 
-  async claimProtocolFees(authority: Keypair, destOwner?: PublicKey): Promise<void> {
-    const owner = destOwner ?? authority.publicKey;
+  /**
+   * Claim protocol fees. Gated on the PROGRAM upgrade authority (pools have
+   * none): `authority` must be the program's upgrade authority and the
+   * ProgramData account is supplied so the program can read it. Fees land in
+   * `authority`'s ATAs (created by the caller).
+   */
+  async claimProtocolFees(authority: Keypair): Promise<void> {
+    const owner = authority.publicKey;
     const ix = new TransactionInstruction({
       programId: PROGRAM_ID,
       keys: [
@@ -727,24 +753,10 @@ class Ctx {
         { pubkey: this.mintA, isSigner: false, isWritable: false },
         { pubkey: this.mintB, isSigner: false, isWritable: false },
         { pubkey: authority.publicKey, isSigner: true, isWritable: false },
+        { pubkey: PROGRAM_DATA_ADDRESS, isSigner: false, isWritable: false },
         { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
       ],
       data: Buffer.from([Ix.ClaimProtocolFees]),
-    });
-    await this.send([ix], [authority]);
-  }
-
-  async transferAuthority(authority: Keypair, newAuthority: PublicKey): Promise<void> {
-    const data = Buffer.alloc(33);
-    data.writeUInt8(Ix.TransferAuthority, 0);
-    newAuthority.toBuffer().copy(data, 1);
-    const ix = new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: this.pool, isSigner: false, isWritable: true },
-        { pubkey: authority.publicKey, isSigner: true, isWritable: false },
-      ],
-      data,
     });
     await this.send([ix], [authority]);
   }
@@ -759,20 +771,6 @@ class Ctx {
       data: Buffer.from([Ix.ClaimLiquidatedRent]),
     });
     await this.send([ix], [borrower]);
-  }
-
-  async updatePoolSettings(authority: Keypair, params: PoolParams): Promise<void> {
-    const ix = new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: this.pool, isSigner: false, isWritable: true },
-        { pubkey: this.vaultA, isSigner: false, isWritable: false },
-        { pubkey: this.vaultB, isSigner: false, isWritable: false },
-        { pubkey: authority.publicKey, isSigner: true, isWritable: false },
-      ],
-      data: encodeParams(Ix.UpdatePoolSettings, params),
-    });
-    await this.send([ix], [authority]);
   }
 
   // ---- state readers ----
@@ -906,7 +904,8 @@ async function runTests() {
       const pool = await ctx.poolState();
       assertEq(pool.mintA.toBase58(), ctx.mintA.toBase58(), 'mint_a');
       assertEq(pool.mintB.toBase58(), ctx.mintB.toBase58(), 'mint_b');
-      assertEq(pool.authority.toBase58(), payer.publicKey.toBase58(), 'authority');
+      // Pools are authority-less: authority is the zero pubkey, not the creator.
+      assertEq(pool.authority.toBase58(), PublicKey.default.toBase58(), 'authority is none');
       assertEq(pool.swapFeeBps, 30, 'swap_fee');
       assertEq(pool.liqRatioBps, 11_000, 'liq_ratio');
       assertEq(pool.openLoans, 0n, 'open_loans');
@@ -933,17 +932,9 @@ async function runTests() {
         Err.MintsNotSorted, 'unsorted mints');
     });
 
-    await T('Initialize pool: parameter bounds enforced', async (ctx) => {
-      await expectError(ctx.initializePool({ ...DEFAULT_PARAMS, liqRatioBps: 10_000 }),
-        Err.SettingExceedsMaximum, 'liq ratio below 101%');
-      await expectError(ctx.initializePool({ ...DEFAULT_PARAMS, swapFeeBps: 1_001 }),
-        Err.SettingExceedsMaximum, 'swap fee above 10%');
-      await expectError(ctx.initializePool({ ...DEFAULT_PARAMS, protocolFeeBps: 31 }),
-        Err.SettingExceedsMaximum, 'protocol fee above swap fee');
-      // max_ltv must stay below BPS^2 / liq_ratio (= 9090 for 110%)
-      await expectError(ctx.initializePool({ ...DEFAULT_PARAMS, maxLtvBps: 9_091 }),
-        Err.SettingExceedsMaximum, 'unsafe ltv');
-    });
+    // (Parameter-bounds test removed: pool economics are fixed program
+    // constants baked in by InitializePool — there are no caller-supplied
+    // params to validate. Bounds are checked at compile time in the program.)
 
     if (tokenProgramId.equals(TOKEN_2022_PROGRAM_ID)) {
       await T('Initialize pool: TransferFee mint rejected', async (ctx) => {
@@ -1078,7 +1069,7 @@ async function runTests() {
       await expectError(ctx.send([ix], [trader]), Err.InvalidPool, 'foreign vault');
     });
 
-    await T('Protocol fees accumulate and are claimable once', async (ctx) => {
+    await T('Protocol fees: only the program upgrade authority can claim', async (ctx) => {
       await ctx.setupPoolWithLiquidity(1_000_000_000n, 4_000_000_000n);
       const trader = await ctx.newUser(10, 100_000_000n, 0n);
       await ctx.swap(trader, 100_000_000n, 1n, true);
@@ -1086,23 +1077,33 @@ async function runTests() {
       // fee = 100M * 30bps = 300k; protocol share = 300k * 5/30 = 50k
       assertEq(pool.protocolFeesA, 50_000n, 'protocol fee A accrued');
 
-      const balBefore = await ctx.tokenBalance(payer.publicKey, ctx.mintA)
-        .catch(() => 0n);
-      // payer needs ATAs for the claim destination
-      const ixs: TransactionInstruction[] = [];
-      for (const mint of [ctx.mintA, ctx.mintB]) {
-        ixs.push(createAssociatedTokenAccountInstruction(payer.publicKey,
-          ctx.ata(payer.publicKey, mint), payer.publicKey, mint,
-          tokenProgramId, ASSOCIATED_TOKEN_PROGRAM_ID));
-      }
-      await ctx.send(ixs, []);
-      await ctx.claimProtocolFees(payer);
-      const balAfter = await ctx.tokenBalance(payer.publicKey, ctx.mintA);
-      assertEq(balAfter - balBefore, 50_000n, 'fees received');
+      const makeAtas = async (owner: PublicKey) => {
+        // Idempotent: `stranger` already has ATAs from newUser; the upgrade
+        // authority does not — this handles both.
+        const ixs: TransactionInstruction[] = [];
+        for (const mint of [ctx.mintA, ctx.mintB]) {
+          ixs.push(createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
+            ctx.ata(owner, mint), owner, mint, tokenProgramId, ASSOCIATED_TOKEN_PROGRAM_ID));
+        }
+        await ctx.send(ixs, []);
+      };
+
+      // A non-upgrade-authority signer (a stranger — pools grant no authority) is rejected.
+      const stranger = await ctx.newUser(10, 0n, 0n);
+      await makeAtas(stranger.publicKey);
+      await expectError(ctx.claimProtocolFees(stranger),
+        Err.InvalidAuthority, 'non-upgrade-authority claim');
+
+      // The program's upgrade authority claims successfully.
+      const authority = loadUpgradeAuthority();
+      await makeAtas(authority.publicKey);
+      await ctx.claimProtocolFees(authority);
+      assertEq(await ctx.tokenBalance(authority.publicKey, ctx.mintA), 50_000n,
+        'fees received by upgrade authority');
       pool = await ctx.poolState();
       assertEq(pool.protocolFeesA, 0n, 'fee counter reset');
       // Second claim: no-op success.
-      await ctx.claimProtocolFees(payer);
+      await ctx.claimProtocolFees(authority);
     });
 
     // ---------- Loans ----------
@@ -1196,20 +1197,9 @@ async function runTests() {
         Err.InvalidPool, 'foreign repay');
     });
 
-    await T('Interest accrues over real slots (100% APR base)', async (ctx) => {
-      // base = 10000 bps = 100% APR at any utilization → visible in seconds.
-      await ctx.setupPoolWithLiquidity(1_000_000_000n, 4_000_000_000n,
-        { ...DEFAULT_PARAMS, interestBaseBps: 10_000 });
-      const borrower = await ctx.newUser(10, 100_000_000n, 100_000_000n);
-      const { loan } = await ctx.openLoan(borrower, COLL_A, 100_000_000n, 300_000_000n);
-      const before = await ctx.tokenBalance(borrower.publicKey, ctx.mintB);
-      await sleep(4_000); // ~10 slots at 100% APR on 300M ≈ 38 raw units
-      await ctx.repayLoan(borrower, loan);
-      const after = await ctx.tokenBalance(borrower.publicKey, ctx.mintB);
-      const repaid = before - after;
-      assert(repaid > 300_000_000n, `interest charged (repaid ${repaid})`);
-      assert(repaid < 300_100_000n, `interest sane (repaid ${repaid})`);
-    });
+    // (Live-slot interest test removed: the interest curve is now a fixed
+    // program constant with base = 0, so 100%-APR-in-seconds can't be
+    // configured. Interest-index math is covered by unit tests in math.rs.)
 
     // ---------- Liquidation engine ----------
 
@@ -1458,34 +1448,9 @@ async function runTests() {
       assertEq(await ctx.lpSupply(), 0n, 'fully exited');
     });
 
-    // ---------- Admin ----------
-
-    await T('Admin: settings update, authority rotation, renounce', async (ctx) => {
-      await ctx.setupPoolWithLiquidity(10_000_000n, 10_000_000n);
-
-      await ctx.updatePoolSettings(payer, { ...DEFAULT_PARAMS, swapFeeBps: 50 });
-      assertEq((await ctx.poolState()).swapFeeBps, 50, 'fee retuned');
-
-      const rando = await ctx.newUser(10, 0n, 0n);
-      await expectError(ctx.updatePoolSettings(rando, DEFAULT_PARAMS),
-        Err.InvalidAuthority, 'non-authority settings');
-      await expectError(ctx.updatePoolSettings(payer, { ...DEFAULT_PARAMS, swapFeeBps: 1_001 }),
-        Err.SettingExceedsMaximum, 'bad params on update');
-
-      const newAuth = await ctx.newUser(10, 0n, 0n);
-      await ctx.transferAuthority(payer, newAuth.publicKey);
-      await expectError(ctx.updatePoolSettings(payer, DEFAULT_PARAMS),
-        Err.InvalidAuthority, 'old authority after rotation');
-      await ctx.updatePoolSettings(newAuth, DEFAULT_PARAMS);
-
-      await ctx.transferAuthority(newAuth, PublicKey.default); // renounce
-      await expectError(ctx.updatePoolSettings(newAuth, DEFAULT_PARAMS),
-        Err.AuthorityRenounced, 'settings after renounce');
-      await expectError(ctx.transferAuthority(newAuth, newAuth.publicKey),
-        Err.AuthorityRenounced, 'un-renounce');
-      await expectError(ctx.claimProtocolFees(newAuth),
-        Err.AuthorityRenounced, 'claim after renounce');
-    });
+    // (Admin test removed: pools are immutable and authority-less — there is
+    // no UpdatePoolSettings or TransferAuthority. Fee-claim authorization is
+    // covered by the "Protocol fees" test above.)
   }
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

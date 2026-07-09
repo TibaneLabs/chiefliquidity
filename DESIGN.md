@@ -135,7 +135,7 @@ pub struct Pool {
     pub vault_a: Pubkey,                 // 32
     pub vault_b: Pubkey,                 // 32
     pub lp_mint: Pubkey,                 // 32
-    pub authority: Pubkey,               // 32   admin (renounceable)
+    pub authority: Pubkey,               // 32   always Pubkey::default() — pools are authority-less (kept for layout)
 
     // PDA bumps
     pub pool_bump: u8,                   // 1
@@ -177,7 +177,7 @@ pub struct Pool {
     pub last_update_slot: u64,           // 8
 
     // Treasury accounting
-    pub protocol_fees_a: u64,            // 8    skimmed; redeemable by authority
+    pub protocol_fees_a: u64,            // 8    skimmed; redeemable by the PROGRAM upgrade authority
     pub protocol_fees_b: u64,            // 8
 
     // Band-presence bitmaps (see §6). Bit i set ↔ a LoanIndexBand PDA exists
@@ -196,11 +196,18 @@ pub struct Pool {
 (verified by `state::tests::pool_size` borsh roundtrip).
 
 Notes:
-- `authority` is renounceable by setting to `Pubkey::default()`, same convention as
-  `StakingPool`.
-- The interest model started as a flat APR (one `interest_rate_bps_per_year`
-  field); it now stores the four-parameter utilization-kink curve plus the two
-  per-side borrow indexes that capitalize accrued interest lazily — see §8.
+- **Pools are immutable and authority-less.** `InitializePool` takes no
+  parameters — every economic field (fees, `liq_ratio_bps`, `max_ltv_bps`, the
+  interest curve) is a fixed program constant, and `authority` is always set to
+  `Pubkey::default()`. There is no `UpdatePoolSettings` or `TransferAuthority`.
+  The config fields are retained in the struct (populated from the constants) for
+  layout stability and so clients/explorers can still read the active values.
+- **Protocol fees are redeemable by the program's upgrade authority**, not any
+  per-pool authority: `ClaimProtocolFees` reads the program's ProgramData
+  account and requires the signer to equal its `upgrade_authority_address`.
+- The interest model stores the four-parameter utilization-kink curve plus the
+  two per-side borrow indexes that capitalize accrued interest lazily — see §8.
+  The parameters are fixed at the program constants; the indexes still evolve.
 - `band_bitmap_*` are the on-chain source of truth for "which bands are
   populated", letting a swap prove it supplied every band a price move could
   cross without an off-chain `getProgramAccounts` walk — see §6.
@@ -501,7 +508,7 @@ Failure modes:
     - `util ≤ kink`: `rate = base + slope1 · util / kink`
     - `util > kink`: `rate = base + slope1 + slope2 · (util − kink) / (1 − kink)`
   - Each side carries a monotone `borrow_index_x_wad` (starts at WAD). On any
-    pool touch (add/remove liquidity, open/repay loan, swap, settings update),
+    pool touch (add/remove liquidity, open/repay loan, swap),
     `Pool::bump_indexes` advances both indexes by
     `index ·= 1 + rate_per_slot · Δslots` (`bump_index_wad`, linear within a
     bump — a slight under-estimate of `e^{rt}` over long idle windows).
@@ -509,8 +516,8 @@ Failure modes:
     `debt_principal · current_index / snapshot` (`owed_from_index`). On repay,
     accrued interest (owed − principal) stays in the vault as LP yield; on
     liquidation it is forfeited (the principal is written off, not paid).
-  - Indexes are always bumped at the rate in effect *before* a parameter change
-    (`UpdatePoolSettings` bumps first), so retuning the curve is prospective.
+  - The curve parameters are fixed program constants, so the rate at a given
+    utilization never changes for the life of a pool.
 
 ---
 
@@ -519,9 +526,10 @@ Failure modes:
 1. **CPMM vs. concentrated** — sticking with CPMM for v1. Concentrated would
    change reserve math meaningfully; revisit after v1 ships.
 2. **Interest model** — ✅ resolved. Implemented as a per-side
-   utilization-kink curve with monotone borrow indexes (§8), retunable via
-   `UpdatePoolSettings`. Linear-within-bump accrual; compounding refinement
-   deferred.
+   utilization-kink curve with monotone borrow indexes (§8). The curve
+   parameters are **fixed program constants** (pools are immutable — there is no
+   `UpdatePoolSettings`); the per-side indexes still evolve with utilization.
+   Linear-within-bump accrual; compounding refinement deferred.
 3. **Oracle** — no external oracle in v1. Trigger prices are denominated in the
    pool's own price (B-per-A). This means the *only* signal driving liquidation
    is real swap activity. That's the design intent (§ project spec) but worth
@@ -550,8 +558,12 @@ Failure modes:
    PDAs unique even if a borrower opens & closes repeatedly. Closed loan
    accounts can be `lamport-zeroed` and reused via realloc, or kept as history.
    Lean toward closing them (refund rent) and incrementing the pool nonce.
-7. **Authority renounce** — same model as chiefstaker (`Pubkey::default()`
-   means renounced); only the swap-fee/liq-config setters are gated by it.
+7. **Authority model** — ✅ resolved. **Pools are immutable and authority-less**:
+   `InitializePool` bakes in fixed economic constants and sets
+   `authority = Pubkey::default()`; the creator gains no rights, and there is no
+   `TransferAuthority`/`UpdatePoolSettings`. The only privileged action is
+   `ClaimProtocolFees`, gated on the **program's upgrade authority** (read from
+   the program's ProgramData account) — not any per-pool authority.
 
 ---
 
@@ -563,16 +575,16 @@ Failure modes:
 | `math.rs` | ✅ | CPMM quoting §8, trigger derivation §3, utilization-kink interest §8 |
 | `events.rs` | ✅ | Structured `sol_log_data` events (§11) |
 | `error.rs` | ✅ | |
-| `instructions/initialize_pool.rs` | ✅ | Validates Token-2022 extensions, creates vaults + LP mint |
+| `instructions/initialize_pool.rs` | ✅ | No args; bakes in fixed constants, `authority = default`, creates vaults + LP mint |
 | `instructions/add_liquidity.rs` | ✅ | |
 | `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate |
 | `instructions/open_loan.rs` | ✅ | Allocates band on first use; increments band count |
 | `instructions/repay_loan.rs` | ✅ | Decrements band count; refunds Loan + empty-Band rent |
 | `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |
-| `instructions/claim_protocol_fees.rs` | ✅ | Authority-only treasury drain |
-| `instructions/transfer_authority.rs` | ✅ | Rotate / renounce |
+| `instructions/claim_protocol_fees.rs` | ✅ | Drain treasury; gated on the program upgrade authority (via ProgramData) |
 | `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |
-| `instructions/update_pool_settings.rs` | ✅ | Prospective param retune |
+| `instructions/transfer_authority.rs` | ⊘ | **Removed** — pools are authority-less |
+| `instructions/update_pool_settings.rs` | ⊘ | **Removed** — pools are immutable (fixed constants) |
 | `instructions/rebalance_bands.rs` | ⊘ | **Retired** — incoherent with deterministic log2 bands; see §6.6 |
 
 Integration tests live in the separate `integration-tests/` cargo project
@@ -617,10 +629,8 @@ failure is swallowed so a dropped log line can never revert committed state.
 | `LoanRepaid` | `RepayLoan` | pool, loan, borrower, debt_principal, total_owed |
 | `LoanLiquidated` | `Swap` (per loan) | pool, loan, borrower, sides, collateral, debt, trigger |
 | `SwapExecuted` | `Swap` | pool, user, a_to_b, amount_in/out, liquidations, protocol_fee |
-| `ProtocolFeesClaimed` | `ClaimProtocolFees` | pool, authority, amount_a/b |
-| `AuthorityTransferred` | `TransferAuthority` | pool, old_authority, new_authority |
+| `ProtocolFeesClaimed` | `ClaimProtocolFees` | pool, authority (program upgrade authority), amount_a/b |
 | `LiquidatedRentClaimed` | `ClaimLiquidatedRent` | pool, loan, borrower |
-| `PoolSettingsUpdated` | `UpdatePoolSettings` | pool, full config |
 
 Discriminators are pinned and round-trip-tested in `events::tests`; they are
 disjoint from account discriminators (which lead with `0xa_`–`0xd_`).
