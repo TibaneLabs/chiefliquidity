@@ -10,7 +10,7 @@ set -e
 export PATH="$HOME/.cargo/bin:$PATH"
 
 PROGRAM_ID="ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw"
-REPO_URL="https://github.com/KarpelesLab/chiefliquidity"
+REPO_URL="https://github.com/TibaneLabs/chiefliquidity"
 LIBRARY_NAME="chiefliquidity"
 
 COMMIT="${1:-$(git rev-parse HEAD)}"
