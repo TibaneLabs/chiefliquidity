@@ -47,6 +47,10 @@ Usage: $0 [options]
   --so <path>           Deploy from a local .so file (skips CI download)
   --run-id <id>         Use a specific GitHub Actions run ID for the artifact
   --priority-fee <N>    Compute unit price, micro-lamports / CU (default: $DEFAULT_PRIORITY_FEE)
+  --max-len <N>         programdata max size in bytes (initial deploy only).
+                        Default: 2x the program size (room to grow via upgrade).
+  --tight               Set --max-len to exactly the program size (cheapest
+                        rent; a later larger upgrade needs 'solana program extend').
   -h, --help            Show this help
 
 With no options: downloads the reproducible artifact from the latest successful
@@ -54,11 +58,16 @@ $WORKFLOW run on master and deploys program $PROGRAM_ID on the configured cluste
 EOF
 }
 
+MAX_LEN=""
+TIGHT=0
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --so)             LOCAL_SO="$2";       shift 2 ;;
         --run-id)         RUN_ID="$2";         shift 2 ;;
         --priority-fee)   PRIORITY_FEE="$2";   shift 2 ;;
+        --max-len)        MAX_LEN="$2";        shift 2 ;;
+        --tight)          TIGHT=1;             shift ;;
         -h|--help)        usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -96,9 +105,25 @@ fi
 
 # --- Pre-flight ----------------------------------------------------------------
 LOCAL_AUTH=$("$SOLANA_CLI" address)
+# --upgrade-authority needs a *signer* (keypair path), not just the address.
+LOCAL_AUTH_KEYPAIR=$("$SOLANA_CLI" config get | awk '/Keypair Path:/ {print $3}')
 RPC_URL=$("$SOLANA_CLI" config get | awk '/^RPC URL:/ {print $3}')
 BALANCE=$("$SOLANA_CLI" balance | awk '{print $1}')
 SO_SIZE=$(wc -c < "$PROGRAM_SO" | tr -d ' ')
+
+# --tight pins programdata to exactly the current binary size (resolved here so
+# it tracks the actual artifact, not a guess).
+if [ "$TIGHT" = "1" ]; then
+    if [ -n "$MAX_LEN" ]; then
+        echo "Error: pass either --tight or --max-len, not both." >&2
+        exit 1
+    fi
+    MAX_LEN="$SO_SIZE"
+fi
+if [ -n "$MAX_LEN" ] && [ "$MAX_LEN" -lt "$SO_SIZE" ]; then
+    echo "Error: --max-len $MAX_LEN is smaller than the program ($SO_SIZE bytes)." >&2
+    exit 1
+fi
 
 # Does the program already exist on this cluster?
 if "$SOLANA_CLI" program show "$PROGRAM_ID" >/dev/null 2>&1; then
@@ -119,6 +144,7 @@ echo "Cluster:       $RPC_URL"
 echo "Payer/auth:    $LOCAL_AUTH ($BALANCE SOL)"
 echo "On-chain auth: $CHAIN_AUTH"
 echo "Priority fee:  $PRIORITY_FEE micro-lamports / CU"
+echo "programdata:   ${MAX_LEN:-2x (default upgrade headroom)}${MAX_LEN:+ bytes (tight)}"
 echo ""
 
 if [ "$MODE" = "initial" ]; then
@@ -139,8 +165,9 @@ if [ "$MODE" = "initial" ]; then
 
     "$SOLANA_CLI" program deploy \
         --program-id "$PROGRAM_KEYPAIR" \
-        --upgrade-authority "$LOCAL_AUTH" \
+        --upgrade-authority "$LOCAL_AUTH_KEYPAIR" \
         --with-compute-unit-price "$PRIORITY_FEE" \
+        ${MAX_LEN:+--max-len "$MAX_LEN"} \
         "$PROGRAM_SO"
 else
     # Upgrade: only the upgrade authority is needed.

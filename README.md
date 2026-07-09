@@ -47,10 +47,19 @@ ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw
 This is the program's fixed on-chain address, baked into the binary via
 `declare_id!` and used by every client and script. The same vanity address is
 used on all clusters; its keypair (required only for the first deploy) lives
-outside the repo at `~/.config/solana/chiefliquidity-program.json`. It has
-**not** yet been deployed to a public cluster — deploy with
-`./scripts/deploy-program.sh` and confirm the on-chain bytecode matches a local
-build with `./scripts/verify-deploy.sh`.
+outside the repo at `~/.config/solana/chiefliquidity-program.json`.
+
+**Deployed to mainnet-beta.** The live bytecode is byte-identical to the
+reproducible CI artifact (`CI` workflow → `chiefliquidity-verifiable`):
+
+| | |
+|---|---|
+| Cluster | mainnet-beta |
+| Upgrade authority | `5uf3zFBnFM291C7Yyn34zg5fHhVSN4fWxDgqNFYpH9G7` |
+| programdata size | 335072 bytes (tight — a larger upgrade needs `solana program extend`) |
+
+Redeploy/upgrade with `./scripts/deploy-program.sh` (it downloads the latest
+green CI artifact) and confirm reproducibility with `./scripts/verify-deploy.sh`.
 
 ## License
 
