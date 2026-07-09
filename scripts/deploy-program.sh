@@ -6,7 +6,7 @@
 # is taken from your `solana config` (so a private Helius URL never lives in
 # source); just point your CLI at the right cluster before running.
 #
-#   --program-id is the vanity address GoZx…cHieF. On the FIRST deploy the
+#   --program-id is the vanity address ChiefQnU…yQw. On the FIRST deploy the
 #   program account does not exist yet, so the program *keypair*
 #   (~/.config/solana/chiefliquidity-program.json) is required to create it at
 #   that address. Afterwards the program exists and only the upgrade authority
