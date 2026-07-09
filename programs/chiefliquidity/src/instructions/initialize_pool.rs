@@ -28,7 +28,7 @@ use crate::{
     events::{Event, PoolInitialized},
     math::BPS_DENOM,
     state::{
-        is_valid_token_program, CurveKind, Pool, LP_MINT_SEED, POOL_DISCRIMINATOR,
+        validate_token_program_for_mint, CurveKind, Pool, LP_MINT_SEED, POOL_DISCRIMINATOR,
         POOL_SEED, VAULT_A_SEED, VAULT_B_SEED,
     },
 };
@@ -78,8 +78,13 @@ const _: () = {
 /// 5. `[writable]` LP mint PDA — `["lp_mint", pool]`
 /// 6. `[writable, signer]` Authority/payer
 /// 7. `[]`        System program
-/// 8. `[]`        Token program (SPL Token or Token 2022)
-/// 9. `[]`        Rent sysvar
+/// 8. `[]`        Token program for mint A (SPL Token or Token 2022)
+/// 9. `[]`        Token program for mint B (SPL Token or Token 2022)
+/// 10. `[]`       Rent sysvar
+///
+/// The two token programs may differ: e.g. a Token-2022 mint paired with a
+/// legacy SPL mint like wSOL. Vault A / the LP mint are created under program A;
+/// vault B under program B.
 pub fn process_initialize_pool(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -94,19 +99,20 @@ pub fn process_initialize_pool(
     let lp_mint_info = next_account_info(it)?;
     let authority_info = next_account_info(it)?;
     let system_program_info = next_account_info(it)?;
-    let token_program_info = next_account_info(it)?;
+    let token_program_a_info = next_account_info(it)?;
+    let token_program_b_info = next_account_info(it)?;
     let rent_sysvar_info = next_account_info(it)?;
 
-    // ---- Signer / token program checks ----
+    // ---- Signer / per-side token program checks ----
 
     if !authority_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    // Each side's token program must be supported AND own that side's mint.
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
 
-    // ---- Mint pair validation (canonical ordering, both same token program) ----
+    // ---- Mint pair validation (canonical ordering) ----
 
     if mint_a_info.key == mint_b_info.key {
         return Err(LiquidityError::MintsMustDiffer.into());
@@ -114,14 +120,9 @@ pub fn process_initialize_pool(
     if mint_a_info.key.as_ref() >= mint_b_info.key.as_ref() {
         return Err(LiquidityError::MintsNotSorted.into());
     }
-    if *mint_a_info.owner != *token_program_info.key
-        || *mint_b_info.owner != *token_program_info.key
-    {
-        return Err(LiquidityError::InvalidMintProgram.into());
-    }
 
-    validate_mint_extensions(mint_a_info, token_program_info.key)?;
-    validate_mint_extensions(mint_b_info, token_program_info.key)?;
+    validate_mint_extensions(mint_a_info, token_program_a_info.key)?;
+    validate_mint_extensions(mint_b_info, token_program_b_info.key)?;
 
     // ---- PDA derivations ----
 
@@ -183,7 +184,7 @@ pub fn process_initialize_pool(
 
     create_vault(
         program_id,
-        token_program_info,
+        token_program_a_info,
         system_program_info,
         authority_info,
         pool_info,
@@ -195,7 +196,7 @@ pub fn process_initialize_pool(
     )?;
     create_vault(
         program_id,
-        token_program_info,
+        token_program_b_info,
         system_program_info,
         authority_info,
         pool_info,
@@ -206,11 +207,11 @@ pub fn process_initialize_pool(
         &rent,
     )?;
 
-    // ---- Create LP Mint (SPL mint, mint authority = Pool PDA) ----
+    // ---- Create LP Mint (created under mint A's token program) ----
 
     create_lp_mint(
         program_id,
-        token_program_info,
+        token_program_a_info,
         system_program_info,
         authority_info,
         pool_info,

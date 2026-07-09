@@ -318,6 +318,7 @@ impl TestEnv {
                 AccountMeta::new(self.payer.pubkey(), true),
                 AccountMeta::new_readonly(solana_program::system_program::id(), false),
                 AccountMeta::new_readonly(self.token_program, false),
+                AccountMeta::new_readonly(self.token_program, false),
                 AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false),
             ],
             data: borsh::to_vec(&data).unwrap(),
@@ -364,6 +365,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_a.pubkey(), false),
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
                 AccountMeta::new_readonly(self.token_program, false),
+                AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
         }
@@ -401,6 +403,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(*user, true),
                 AccountMeta::new_readonly(self.mint_a.pubkey(), false),
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new_readonly(self.token_program, false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
@@ -529,6 +532,7 @@ impl TestEnv {
                 AccountMeta::new(band_pda, false),
                 AccountMeta::new_readonly(solana_program::system_program::id(), false),
                 AccountMeta::new_readonly(self.token_program, false),
+                AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
         };
@@ -564,6 +568,7 @@ impl TestEnv {
                 AccountMeta::new(loan_pda, false),
                 AccountMeta::new(band_pda, false),
                 AccountMeta::new_readonly(self.token_program, false),
+                AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
         };
@@ -596,6 +601,7 @@ impl TestEnv {
             AccountMeta::new_readonly(self.mint_a.pubkey(), false),
             AccountMeta::new_readonly(self.mint_b.pubkey(), false),
             AccountMeta::new_readonly(user.pubkey(), true),
+            AccountMeta::new_readonly(self.token_program, false),
             AccountMeta::new_readonly(self.token_program, false),
         ];
         let direction: u8 = if a_to_b { 0 } else { 1 };
@@ -709,6 +715,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
                 AccountMeta::new_readonly(authority.pubkey(), true),
                 AccountMeta::new_readonly(self.program_data_pda(), false),
+                AccountMeta::new_readonly(self.token_program, false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),

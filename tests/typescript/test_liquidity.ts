@@ -392,6 +392,11 @@ class Ctx {
   connection: Connection;
   payer: Keypair;
   tokenProgram: PublicKey;
+  // Per-side token programs. Default both to `tokenProgram` (same-program pool);
+  // set them differently before setup() for a mixed pool (e.g. Token-2022 / wSOL).
+  // The LP mint always rides on program A (mint A's program).
+  tokenProgramA: PublicKey;
+  tokenProgramB: PublicKey;
   mintA!: PublicKey;
   mintB!: PublicKey;
   pool!: PublicKey;
@@ -404,7 +409,14 @@ class Ctx {
     this.connection = connection;
     this.payer = payer;
     this.tokenProgram = tokenProgram;
+    this.tokenProgramA = tokenProgram;
+    this.tokenProgramB = tokenProgram;
     this.authority = payer;
+  }
+
+  /** The token program that owns `mint` (mint B → B; mint A and the LP mint → A). */
+  programFor(mint: PublicKey): PublicKey {
+    return this.mintB && mint.equals(this.mintB) ? this.tokenProgramB : this.tokenProgramA;
   }
 
   /** Create two fresh sorted mints (A: 9 decimals, B: 6) and derive pool PDAs. */
@@ -414,10 +426,11 @@ class Ctx {
     if (Buffer.compare(a.publicKey.toBuffer(), b.publicKey.toBuffer()) > 0) {
       [a, b] = [b, a];
     }
+    // Mint A under program A, mint B under program B (equal by default).
     await createMint(this.connection, this.payer, this.payer.publicKey, null, 9,
-      a, { commitment: 'confirmed' }, this.tokenProgram);
+      a, { commitment: 'confirmed' }, this.tokenProgramA);
     await createMint(this.connection, this.payer, this.payer.publicKey, null, 6,
-      b, { commitment: 'confirmed' }, this.tokenProgram);
+      b, { commitment: 'confirmed' }, this.tokenProgramB);
     this.mintA = a.publicKey;
     this.mintB = b.publicKey;
     [this.pool] = PublicKey.findProgramAddressSync(
@@ -442,7 +455,7 @@ class Ctx {
   }
 
   ata(owner: PublicKey, mint: PublicKey): PublicKey {
-    return getAssociatedTokenAddressSync(mint, owner, false, this.tokenProgram);
+    return getAssociatedTokenAddressSync(mint, owner, false, this.programFor(mint));
   }
 
   async send(ixs: TransactionInstruction[], signers: Keypair[],
@@ -462,22 +475,22 @@ class Ctx {
       }),
       createAssociatedTokenAccountInstruction(this.payer.publicKey,
         this.ata(user.publicKey, this.mintA), user.publicKey, this.mintA,
-        this.tokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID),
+        this.programFor(this.mintA), ASSOCIATED_TOKEN_PROGRAM_ID),
       createAssociatedTokenAccountInstruction(this.payer.publicKey,
         this.ata(user.publicKey, this.mintB), user.publicKey, this.mintB,
-        this.tokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID),
+        this.programFor(this.mintB), ASSOCIATED_TOKEN_PROGRAM_ID),
       createAssociatedTokenAccountInstruction(this.payer.publicKey,
         this.ata(user.publicKey, this.lpMint), user.publicKey, this.lpMint,
-        this.tokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID),
+        this.programFor(this.lpMint), ASSOCIATED_TOKEN_PROGRAM_ID),
     ];
     await this.send(ixs, []);
     if (tokenA > 0n) {
       await mintTo(this.connection, this.payer, this.mintA, this.ata(user.publicKey, this.mintA),
-        this.payer, tokenA, [], { commitment: 'confirmed' }, this.tokenProgram);
+        this.payer, tokenA, [], { commitment: 'confirmed' }, this.programFor(this.mintA));
     }
     if (tokenB > 0n) {
       await mintTo(this.connection, this.payer, this.mintB, this.ata(user.publicKey, this.mintB),
-        this.payer, tokenB, [], { commitment: 'confirmed' }, this.tokenProgram);
+        this.payer, tokenB, [], { commitment: 'confirmed' }, this.programFor(this.mintB));
     }
     return user;
   }
@@ -496,7 +509,8 @@ class Ctx {
         { pubkey: this.lpMint, isSigner: false, isWritable: true },
         { pubkey: this.authority.publicKey, isSigner: true, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
         { pubkey: new PublicKey('SysvarRent111111111111111111111111111111111'), isSigner: false, isWritable: false },
       ],
       // Pools are immutable/authority-less: InitializePool takes no args.
@@ -528,7 +542,8 @@ class Ctx {
         { pubkey: user.publicKey, isSigner: true, isWritable: false },
         { pubkey: this.mintA, isSigner: false, isWritable: false },
         { pubkey: this.mintB, isSigner: false, isWritable: false },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data,
     });
@@ -554,7 +569,8 @@ class Ctx {
         { pubkey: user.publicKey, isSigner: true, isWritable: false },
         { pubkey: this.mintA, isSigner: false, isWritable: false },
         { pubkey: this.mintB, isSigner: false, isWritable: false },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data,
     });
@@ -603,7 +619,8 @@ class Ctx {
         { pubkey: loan, isSigner: false, isWritable: true },
         { pubkey: band, isSigner: false, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data,
     });
@@ -630,7 +647,8 @@ class Ctx {
         { pubkey: signer.publicKey, isSigner: true, isWritable: true },
         { pubkey: loan, isSigner: false, isWritable: true },
         { pubkey: band, isSigner: false, isWritable: true },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data: Buffer.from([Ix.RepayLoan]),
     });
@@ -709,7 +727,8 @@ class Ctx {
       { pubkey: this.mintA, isSigner: false, isWritable: false },
       { pubkey: this.mintB, isSigner: false, isWritable: false },
       { pubkey: user, isSigner: true, isWritable: false },
-      { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+      { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+      { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
     ];
     const direction = aToB ? DIR_FALL : DIR_RISE;
     for (const b of bands) {
@@ -756,7 +775,8 @@ class Ctx {
         { pubkey: this.mintB, isSigner: false, isWritable: false },
         { pubkey: authority.publicKey, isSigner: true, isWritable: false },
         { pubkey: PROGRAM_DATA_ADDRESS, isSigner: false, isWritable: false },
-        { pubkey: this.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data: Buffer.from([Ix.ClaimProtocolFees]),
     });
@@ -794,18 +814,18 @@ class Ctx {
   }
 
   async tokenBalance(owner: PublicKey, mint: PublicKey): Promise<bigint> {
-    const acc = await getAccount(this.connection, this.ata(owner, mint), 'confirmed', this.tokenProgram);
+    const acc = await getAccount(this.connection, this.ata(owner, mint), 'confirmed', this.programFor(mint));
     return acc.amount;
   }
 
   async vaultBalances(): Promise<{ a: bigint; b: bigint }> {
-    const a = await getAccount(this.connection, this.vaultA, 'confirmed', this.tokenProgram);
-    const b = await getAccount(this.connection, this.vaultB, 'confirmed', this.tokenProgram);
+    const a = await getAccount(this.connection, this.vaultA, 'confirmed', this.tokenProgramA);
+    const b = await getAccount(this.connection, this.vaultB, 'confirmed', this.tokenProgramB);
     return { a: a.amount, b: b.amount };
   }
 
   async lpSupply(): Promise<bigint> {
-    return (await getMint(this.connection, this.lpMint, 'confirmed', this.tokenProgram)).supply;
+    return (await getMint(this.connection, this.lpMint, 'confirmed', this.tokenProgramA)).supply;
   }
 
   /** initialize + seed: returns the LP user. */
@@ -1484,6 +1504,39 @@ async function runTests() {
     // no UpdatePoolSettings or TransferAuthority. Fee-claim authorization is
     // covered by the "Protocol fees" test above.)
   }
+
+  // ---------- Mixed token-program pool (Token-2022 side + legacy SPL side) ----------
+  // The headline of this feature: a Token-2022 mint can be paired with a legacy
+  // SPL mint (e.g. a Token-2022 token / wSOL pool). Each side's vault + CPIs use
+  // that side's token program; the LP mint rides on side A's program.
+  await test('Mixed pool: Token-2022 side + legacy SPL side (init/add/swap/loan/remove)', async () => {
+    const ctx = new Ctx(connection, payer, TOKEN_2022_PROGRAM_ID);
+    ctx.tokenProgramA = TOKEN_2022_PROGRAM_ID; // mint A (+ LP mint) on Token-2022
+    ctx.tokenProgramB = TOKEN_PROGRAM_ID;      // mint B on legacy SPL Token
+    await ctx.setup();
+
+    const lp = await ctx.setupPoolWithLiquidity(1_000_000_000n, 4_000_000_000n);
+    const pool = await ctx.poolState();
+    assertEq(pool.mintA.toBase58(), ctx.mintA.toBase58(), 'mixed pool initialized');
+
+    // Swap both directions — each exercises one CPI on each token program.
+    const trader = await ctx.newUser(10, 20_000_000n, 100_000_000n);
+    await ctx.swap(trader, 20_000_000n, 1n, true);  // A(T22) in, B(legacy) out
+    assert((await ctx.tokenBalance(trader.publicKey, ctx.mintB)) > 100_000_000n, 'got B out');
+    await ctx.swap(trader, 40_000_000n, 1n, false); // B(legacy) in, A(T22) out
+
+    // Loan across the two programs: collateral A (T22) in, debt B (legacy) out, then repay.
+    const borrower = await ctx.newUser(10, 100_000_000n, 300_000_000n);
+    const { loan } = await ctx.openLoan(borrower, COLL_A, 100_000_000n, 200_000_000n);
+    assertEq((await ctx.poolState()).openLoans, 1n, 'loan open in mixed pool');
+    await ctx.repayLoan(borrower, loan);
+    assertEq((await ctx.poolState()).openLoans, 0n, 'loan repaid');
+
+    // LP exits fully.
+    const lpBal = await ctx.tokenBalance(lp.publicKey, ctx.lpMint);
+    await ctx.removeLiquidity(lp, lpBal, 1n, 1n);
+    assertEq(await ctx.lpSupply(), 0n, 'LP fully exited mixed pool');
+  });
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   process.exit(failed > 0 ? 1 : 0);

@@ -205,6 +205,13 @@ Notes:
 - **Protocol fees are redeemable by the program's upgrade authority**, not any
   per-pool authority: `ClaimProtocolFees` reads the program's ProgramData
   account and requires the signer to equal its `upgrade_authority_address`.
+- **The two sides may use different token programs.** A Token-2022 mint can be
+  paired with a legacy SPL mint (e.g. a Token-2022 token / wSOL pool). Each
+  instruction takes a `token_program_a` and a `token_program_b`, validated to be
+  a supported token program that owns the respective mint; every token CPI
+  targets the program for that side. Vault A and the LP mint are created under
+  program A, vault B under program B. Token-2022 mints on either side are still
+  gated by the extension allowlist (§ `initialize_pool.rs`).
 - The interest model stores the four-parameter utilization-kink curve plus the
   two per-side borrow indexes that capitalize accrued interest lazily — see §8.
   The parameters are fixed at the program constants; the indexes still evolve.
@@ -448,7 +455,8 @@ Fixed prefix:
 5.   []          Mint A
 6.   []          Mint B
 7.   [signer]    User
-8.   []          Token program
+8.   []          Token program for mint A
+9.   []          Token program for mint B
 
 Per band (repeated for each entry in band_loan_counts):
      [writable]  Band PDA

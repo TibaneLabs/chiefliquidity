@@ -19,7 +19,7 @@ use crate::{
     error::LiquidityError,
     events::{Event, LiquidityAdded},
     math::{isqrt_u128, mul_div},
-    state::{is_valid_token_program, Pool, POOL_SEED},
+    state::{validate_token_program_for_mint, Pool, POOL_SEED},
 };
 
 /// Minimum first-deposit per side. Prevents share-inflation tricks where the
@@ -46,15 +46,16 @@ pub fn process_add_liquidity(
     let user_info = next_account_info(it)?;
     let mint_a_info = next_account_info(it)?;
     let mint_b_info = next_account_info(it)?;
-    let token_program_info = next_account_info(it)?;
+    let token_program_a_info = next_account_info(it)?;
+    let token_program_b_info = next_account_info(it)?;
 
     // ---- Validation ----
     if !user_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    // Per-side token programs (LP mint rides on mint A's program).
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id {
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
@@ -151,7 +152,7 @@ pub fn process_add_liquidity(
     // ---- Transfer A from user → vault A ----
     invoke(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            token_program_a_info.key,
             user_a_info.key,
             mint_a_info.key,
             vault_a_info.key,
@@ -171,7 +172,7 @@ pub fn process_add_liquidity(
     // ---- Transfer B from user → vault B ----
     invoke(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            token_program_b_info.key,
             user_b_info.key,
             mint_b_info.key,
             vault_b_info.key,
@@ -197,7 +198,7 @@ pub fn process_add_liquidity(
     ];
     invoke_signed(
         &spl_token_2022::instruction::mint_to_checked(
-            token_program_info.key,
+            token_program_a_info.key,
             lp_mint_info.key,
             user_lp_info.key,
             pool_info.key,

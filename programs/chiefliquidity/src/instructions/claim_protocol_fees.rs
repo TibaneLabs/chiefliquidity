@@ -18,7 +18,7 @@ use spl_token_2022::{extension::StateWithExtensions, state::Mint};
 use crate::{
     error::LiquidityError,
     events::{Event, ProtocolFeesClaimed},
-    state::{is_valid_token_program, Pool, POOL_SEED},
+    state::{validate_token_program_for_mint, Pool, POOL_SEED},
 };
 
 pub fn process_claim_protocol_fees(
@@ -36,14 +36,14 @@ pub fn process_claim_protocol_fees(
     let mint_b_info = next_account_info(it)?;
     let authority_info = next_account_info(it)?;
     let program_data_info = next_account_info(it)?;
-    let token_program_info = next_account_info(it)?;
+    let token_program_a_info = next_account_info(it)?;
+    let token_program_b_info = next_account_info(it)?;
 
     if !authority_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id {
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
@@ -116,7 +116,7 @@ pub fn process_claim_protocol_fees(
     if amount_a > 0 {
         invoke_signed(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_a_info.key,
                 vault_a_info.key,
                 mint_a_info.key,
                 dest_a_info.key,
@@ -137,7 +137,7 @@ pub fn process_claim_protocol_fees(
     if amount_b > 0 {
         invoke_signed(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_b_info.key,
                 vault_b_info.key,
                 mint_b_info.key,
                 dest_b_info.key,

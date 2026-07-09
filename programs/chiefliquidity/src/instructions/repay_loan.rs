@@ -27,7 +27,7 @@ use crate::{
     events::{Event, LoanRepaid},
     math::LoanSides,
     state::{
-        bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, Pool, POOL_SEED,
+        bitmap_clear, validate_token_program_for_mint, Loan, LoanIndexBand, Pool, POOL_SEED,
     },
 };
 
@@ -47,14 +47,14 @@ pub fn process_repay_loan(
     let borrower_info = next_account_info(it)?;
     let loan_info = next_account_info(it)?;
     let band_info = next_account_info(it)?;
-    let token_program_info = next_account_info(it)?;
+    let token_program_a_info = next_account_info(it)?;
+    let token_program_b_info = next_account_info(it)?;
 
     if !borrower_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id
         || loan_info.owner != program_id
         || band_info.owner != program_id
@@ -141,37 +141,43 @@ pub fn process_repay_loan(
         debt_vault_info,
         debt_mint_info,
         debt_decimals,
+        debt_token_program_info,
         collateral_user_info,
         collateral_vault_info,
         collateral_mint_info,
         collateral_decimals,
+        collateral_token_program_info,
     ) = match sides {
         LoanSides::CollateralA => (
             user_b_info,
             vault_b_info,
             mint_b_info,
             mint_b_decimals,
+            token_program_b_info,
             user_a_info,
             vault_a_info,
             mint_a_info,
             mint_a_decimals,
+            token_program_a_info,
         ),
         LoanSides::CollateralB => (
             user_a_info,
             vault_a_info,
             mint_a_info,
             mint_a_decimals,
+            token_program_a_info,
             user_b_info,
             vault_b_info,
             mint_b_info,
             mint_b_decimals,
+            token_program_b_info,
         ),
     };
 
     // Borrower → vault: principal + accrued
     invoke(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            debt_token_program_info.key,
             debt_user_info.key,
             debt_mint_info.key,
             debt_vault_info.key,
@@ -197,7 +203,7 @@ pub fn process_repay_loan(
     ];
     invoke_signed(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            collateral_token_program_info.key,
             collateral_vault_info.key,
             collateral_mint_info.key,
             collateral_user_info.key,

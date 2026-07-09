@@ -85,7 +85,8 @@ function rawSwapIx(
     { pubkey: ctx.mintA, isSigner: false, isWritable: false },
     { pubkey: ctx.mintB, isSigner: false, isWritable: false },
     { pubkey: user, isSigner: true, isWritable: false },
-    { pubkey: ctx.tokenProgram, isSigner: false, isWritable: false },
+    { pubkey: ctx.tokenProgramA, isSigner: false, isWritable: false },
+    { pubkey: ctx.tokenProgramB, isSigner: false, isWritable: false },
   ];
   for (const b of bands) {
     keys.push({ pubkey: b.bandPda, isSigner: false, isWritable: true });
@@ -371,7 +372,8 @@ async function run() {
       { pubkey: ctx.mintA, isSigner: false, isWritable: false },
       { pubkey: ctx.mintB, isSigner: false, isWritable: false },
       { pubkey: trader.publicKey, isSigner: true, isWritable: false },
-      { pubkey: ctx.tokenProgram, isSigner: false, isWritable: false },
+      { pubkey: ctx.tokenProgramA, isSigner: false, isWritable: false },
+      { pubkey: ctx.tokenProgramB, isSigner: false, isWritable: false },
       { pubkey: ctx.bandPda(DIR_FALL, bandId), isSigner: false, isWritable: true },
       { pubkey: loan, isSigner: false, isWritable: true }, // only ONE loan, not two
     ];
@@ -419,7 +421,8 @@ async function run() {
         { pubkey: borrower.publicKey, isSigner: true, isWritable: true },
         { pubkey: loan, isSigner: false, isWritable: true },
         { pubkey: wrongBand, isSigner: false, isWritable: true },
-        { pubkey: ctx.tokenProgram, isSigner: false, isWritable: false },
+        { pubkey: ctx.tokenProgramA, isSigner: false, isWritable: false },
+        { pubkey: ctx.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data: Buffer.from([Ix.RepayLoan]),
     });

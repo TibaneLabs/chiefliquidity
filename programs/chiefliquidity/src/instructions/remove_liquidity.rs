@@ -19,7 +19,7 @@ use crate::{
     error::LiquidityError,
     events::{Event, LiquidityRemoved},
     math::mul_div,
-    state::{is_valid_token_program, Pool, POOL_SEED},
+    state::{validate_token_program_for_mint, Pool, POOL_SEED},
 };
 
 pub fn process_remove_liquidity(
@@ -41,14 +41,15 @@ pub fn process_remove_liquidity(
     let user_info = next_account_info(it)?;
     let mint_a_info = next_account_info(it)?;
     let mint_b_info = next_account_info(it)?;
-    let token_program_info = next_account_info(it)?;
+    let token_program_a_info = next_account_info(it)?;
+    let token_program_b_info = next_account_info(it)?;
 
     if !user_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    // Per-side token programs (LP mint rides on mint A's program).
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id {
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
@@ -119,7 +120,7 @@ pub fn process_remove_liquidity(
     // ---- Burn LP from user ----
     invoke(
         &spl_token_2022::instruction::burn_checked(
-            token_program_info.key,
+            token_program_a_info.key,
             user_lp_info.key,
             lp_mint_info.key,
             user_info.key,
@@ -143,7 +144,7 @@ pub fn process_remove_liquidity(
     ];
     invoke_signed(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            token_program_a_info.key,
             vault_a_info.key,
             mint_a_info.key,
             user_a_info.key,
@@ -164,7 +165,7 @@ pub fn process_remove_liquidity(
     // ---- Transfer B from vault → user ----
     invoke_signed(
         &spl_token_2022::instruction::transfer_checked(
-            token_program_info.key,
+            token_program_b_info.key,
             vault_b_info.key,
             mint_b_info.key,
             user_b_info.key,

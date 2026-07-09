@@ -142,6 +142,7 @@ async fn swap_with_wrong_vault_rejected() {
             solana_program::instruction::AccountMeta::new_readonly(env.mint_b.pubkey(), false),
             solana_program::instruction::AccountMeta::new_readonly(trader.pubkey(), true),
             solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
+            solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
         ],
         data: borsh::to_vec(&data).unwrap(),
     };

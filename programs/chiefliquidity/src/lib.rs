@@ -45,8 +45,11 @@ pub enum LiquidityInstruction {
     /// 5. `[writable]` LP mint (PDA: ["lp_mint", pool])
     /// 6. `[writable, signer]` Payer (funds rent only; NOT recorded as authority)
     /// 7. `[]` System program
-    /// 8. `[]` Token program
-    /// 9. `[]` Rent sysvar
+    /// 8. `[]` Token program for mint A (owns mint A + the LP mint)
+    /// 9. `[]` Token program for mint B (owns mint B)
+    /// 10. `[]` Rent sysvar
+    ///
+    /// Programs 8 and 9 may differ (e.g. a Token-2022 mint paired with legacy wSOL).
     InitializePool,
 
     /// Deposit `amount_a_max` of A and `amount_b_max` of B (or proportional
@@ -67,7 +70,8 @@ pub enum LiquidityInstruction {
     /// 7. `[signer]`   User
     /// 8. `[]`         Mint A
     /// 9. `[]`         Mint B
-    /// 10. `[]`        Token program
+    /// 10. `[]`        Token program for mint A (also mints the LP token)
+    /// 11. `[]`        Token program for mint B
     AddLiquidity {
         amount_a_max: u64,
         amount_b_max: u64,
@@ -89,7 +93,8 @@ pub enum LiquidityInstruction {
     /// 7. `[signer]`   User
     /// 8. `[]`         Mint A
     /// 9. `[]`         Mint B
-    /// 10. `[]`        Token program
+    /// 10. `[]`        Token program for mint A (also burns the LP token)
+    /// 11. `[]`        Token program for mint B
     RemoveLiquidity {
         lp_amount: u64,
         min_a_out: u64,
@@ -118,7 +123,8 @@ pub enum LiquidityInstruction {
     /// 8. `[writable]` Loan PDA — `["loan", pool, borrower, nonce_le]`
     /// 9. `[writable]` Band PDA — `["band", pool, direction, band_id_le]`
     /// 10. `[]`        System program
-    /// 11. `[]`        Token program
+    /// 11. `[]`        Token program for mint A
+    /// 12. `[]`        Token program for mint B
     OpenLoan {
         sides: u8,
         collateral_amount: u64,
@@ -143,7 +149,8 @@ pub enum LiquidityInstruction {
     /// 7. `[writable, signer]` Borrower
     /// 8. `[writable]` Loan
     /// 9. `[writable]` Band
-    /// 10. `[]`        Token program
+    /// 10. `[]`        Token program for mint A
+    /// 11. `[]`        Token program for mint B
     RepayLoan,
 
     /// Drain accumulated protocol fees from the vaults to the caller's token
@@ -166,7 +173,8 @@ pub enum LiquidityInstruction {
     /// 6. `[]`         Mint B
     /// 7. `[signer]`   Program upgrade authority (fee recipient)
     /// 8. `[]`         Program ProgramData account (source of the upgrade authority)
-    /// 9. `[]`         Token program
+    /// 9. `[]`         Token program for mint A
+    /// 10. `[]`        Token program for mint B
     ClaimProtocolFees,
 
     /// Borrower-callable: reclaim the rent on a `Loan` that was liquidated
@@ -201,7 +209,8 @@ pub enum LiquidityInstruction {
     /// 5. `[]`         Mint A
     /// 6. `[]`         Mint B
     /// 7. `[signer]`   User
-    /// 8. `[]`         Token program
+    /// 8. `[]`         Token program for mint A
+    /// 9. `[]`         Token program for mint B
     ///
     /// Accounts (per band, repeated for each entry in `band_loan_counts`):
     ///   `[writable]` Band PDA

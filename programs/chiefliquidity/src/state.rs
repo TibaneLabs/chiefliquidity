@@ -1,7 +1,7 @@
 //! Account state structures — see `DESIGN.md` §4–§5.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::pubkey::Pubkey;
+use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
 
 use crate::error::LiquidityError;
 
@@ -34,6 +34,20 @@ pub const SPL_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 /// Returns true if `key` is one of the two SPL Token program IDs we accept.
 pub fn is_valid_token_program(key: &Pubkey) -> bool {
     *key == spl_token_2022::id() || *key == SPL_TOKEN_PROGRAM_ID
+}
+
+/// Validate that `token_program` is a supported token program **and** is the
+/// program that actually owns `mint`. Each pool side carries its own token
+/// program (a Token-2022 mint can be paired with a legacy SPL mint like wSOL),
+/// so every token CPI must target the program owning that side's mint.
+pub fn validate_token_program_for_mint(
+    token_program: &AccountInfo,
+    mint: &AccountInfo,
+) -> Result<(), LiquidityError> {
+    if !is_valid_token_program(token_program.key) || token_program.key != mint.owner {
+        return Err(LiquidityError::InvalidTokenProgram);
+    }
+    Ok(())
 }
 
 // ===== Curve kinds =====

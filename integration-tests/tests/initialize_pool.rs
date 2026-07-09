@@ -129,6 +129,7 @@ async fn rejects_unsorted_mints() {
             AccountMeta::new(env.payer.pubkey(), true),
             AccountMeta::new_readonly(solana_program::system_program::id(), false),
             AccountMeta::new_readonly(env.token_program, false),
+            AccountMeta::new_readonly(env.token_program, false),
             AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false),
         ],
         data: borsh::to_vec(&data).unwrap(),

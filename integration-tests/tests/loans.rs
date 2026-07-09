@@ -131,6 +131,7 @@ async fn open_loan_zero_amount() {
                 false,
             ),
             solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
+            solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
         ],
         data: borsh::to_vec(&data).unwrap(),
     };
@@ -242,6 +243,7 @@ async fn repay_loan_wrong_borrower_rejected() {
             solana_program::instruction::AccountMeta::new(bob.pubkey(), true),
             solana_program::instruction::AccountMeta::new(alice_loan_pda, false),
             solana_program::instruction::AccountMeta::new(band_pda, false),
+            solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
             solana_program::instruction::AccountMeta::new_readonly(env.token_program, false),
         ],
         data: borsh::to_vec(&data).unwrap(),

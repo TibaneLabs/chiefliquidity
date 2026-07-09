@@ -40,7 +40,7 @@ use crate::{
         TriggerDirection, BPS_DENOM,
     },
     state::{
-        bitmap_clear, bitmap_iter_set_range, is_valid_token_program, Loan, LoanIndexBand,
+        bitmap_clear, bitmap_iter_set_range, validate_token_program_for_mint, Loan, LoanIndexBand,
         Pool, POOL_SEED,
     },
 };
@@ -48,7 +48,7 @@ use crate::{
 /// Per-transaction cap on liquidations, to bound CU and account-list usage.
 pub const MAX_LIQ_PER_SWAP: u32 = 8;
 
-const FIXED_PREFIX_LEN: usize = 9;
+const FIXED_PREFIX_LEN: usize = 10;
 
 #[derive(Debug)]
 struct LoanCtx {
@@ -97,14 +97,14 @@ pub fn process_swap(
     let mint_a_info = &accounts[5];
     let mint_b_info = &accounts[6];
     let user_info = &accounts[7];
-    let token_program_info = &accounts[8];
+    let token_program_a_info = &accounts[8];
+    let token_program_b_info = &accounts[9];
 
     if !user_info.is_signer {
         return Err(LiquidityError::MissingRequiredSigner.into());
     }
-    if !is_valid_token_program(token_program_info.key) {
-        return Err(LiquidityError::InvalidTokenProgram.into());
-    }
+    validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
+    validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id {
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
@@ -471,7 +471,7 @@ pub fn process_swap(
         // user A → vault A
         invoke(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_a_info.key,
                 user_a_info.key,
                 mint_a_info.key,
                 vault_a_info.key,
@@ -490,7 +490,7 @@ pub fn process_swap(
         // vault B → user B
         invoke_signed(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_b_info.key,
                 vault_b_info.key,
                 mint_b_info.key,
                 user_b_info.key,
@@ -511,7 +511,7 @@ pub fn process_swap(
         // user B → vault B
         invoke(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_b_info.key,
                 user_b_info.key,
                 mint_b_info.key,
                 vault_b_info.key,
@@ -530,7 +530,7 @@ pub fn process_swap(
         // vault A → user A
         invoke_signed(
             &spl_token_2022::instruction::transfer_checked(
-                token_program_info.key,
+                token_program_a_info.key,
                 vault_a_info.key,
                 mint_a_info.key,
                 user_a_info.key,

@@ -76,9 +76,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         },
         {
@@ -170,9 +176,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
@@ -279,9 +291,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
@@ -397,9 +415,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
@@ -514,9 +538,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
@@ -593,9 +623,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
@@ -694,9 +730,15 @@
           ]
         },
         {
-          "name": "tokenProgram",
+          "name": "tokenProgramA",
           "docs": [
-            "Token program (SPL Token or Token 2022)"
+            "Token program owning mint A (SPL Token or Token 2022)"
+          ]
+        },
+        {
+          "name": "tokenProgramB",
+          "docs": [
+            "Token program owning mint B (SPL Token or Token 2022)"
           ]
         }
       ],
