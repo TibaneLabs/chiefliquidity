@@ -77,7 +77,8 @@ npx @solana-program/program-metadata@latest write idl \
     "$PROGRAM_ID" \
     "$MINIFIED" \
     --keypair "$KEYPAIR" \
-    --rpc "$RPC_URL"
+    --rpc "$RPC_URL" \
+    --priority-fees "$PRIORITY_FEES"
 
 echo ""
 echo "IDL published successfully!"
