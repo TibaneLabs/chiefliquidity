@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-PROGRAM_ID="GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF"
+PROGRAM_ID="ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw"
 PROGRAM_KEYPAIR="$HOME/.config/solana/chiefliquidity-program.json"
 REPO="KarpelesLab/chiefliquidity"
 WORKFLOW="CI"

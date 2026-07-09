@@ -41,15 +41,16 @@ cargo build-sbf           # SBF bytecode for deployment
 ## Program ID
 
 ```
-GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF
+ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw
 ```
 
 This is the program's fixed on-chain address, baked into the binary via
 `declare_id!` and used by every client and script. The same vanity address is
-used on all clusters (its keypair lives at
-`target/deploy/chiefliquidity-keypair.json`). It has **not** yet been deployed
-to a public cluster — deploy with `./scripts/deploy-program.sh` and confirm the
-on-chain bytecode matches a local build with `./scripts/verify-deploy.sh`.
+used on all clusters; its keypair (required only for the first deploy) lives
+outside the repo at `~/.config/solana/chiefliquidity-program.json`. It has
+**not** yet been deployed to a public cluster — deploy with
+`./scripts/deploy-program.sh` and confirm the on-chain bytecode matches a local
+build with `./scripts/verify-deploy.sh`.
 
 ## License
 

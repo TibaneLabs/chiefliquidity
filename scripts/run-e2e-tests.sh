@@ -11,7 +11,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PROGRAM_ID="GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF"
+PROGRAM_ID="ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw"
 
 AGAVE_LOCAL="$HOME/.local/share/solana/install/active_release/bin"
 if [ -x "/pkg/main/net-p2p.agave.core/bin/solana" ]; then

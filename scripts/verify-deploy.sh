@@ -9,7 +9,7 @@ set -e
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
-PROGRAM_ID="GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF"
+PROGRAM_ID="ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw"
 REPO_URL="https://github.com/KarpelesLab/chiefliquidity"
 LIBRARY_NAME="chiefliquidity"
 

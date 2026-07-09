@@ -21,7 +21,7 @@ use instructions::*;
 // Canonical program ID (vanity address ending in "cHieF"). The matching
 // keypair lives at ~/.config/solana/chiefliquidity-program.json and is used
 // only for the initial deploy; upgrades are gated by the upgrade authority.
-solana_program::declare_id!("GoZxsxr2Na4auUuY7TMRi8psnU2X9NtnE73CE5cHieF");
+solana_program::declare_id!("ChiefQnUMyz7V1U9odcoxCar66ngVZn1wXFDecnN7yQw");
 
 /// Program instructions.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
