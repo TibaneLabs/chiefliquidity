@@ -1,9 +1,10 @@
 //! Initialize a new (mint_a, mint_b) liquidity pool.
 //!
 //! Permissionless: any signer that pays rent can create a pool for any
-//! validated mint pair. The signer becomes the pool's `authority` (which
-//! controls fee-skim withdrawal); authority can be renounced later by
-//! transferring it to `Pubkey::default()`.
+//! validated mint pair. Pools are authority-less by construction — the stored
+//! `authority` is hardcoded to `Pubkey::default()`, so creating a pool grants
+//! no special rights and there is no pool admin to retune or drain it. Fee
+//! redemption is gated on the program's upgrade authority, not the pool.
 
 use borsh::BorshSerialize;
 use solana_program::{
@@ -438,8 +439,8 @@ fn create_lp_mint<'a>(
         &spl_token_2022::instruction::initialize_mint2(
             token_program_info.key,
             lp_mint_info.key,
-            pool_info.key,       // mint authority = pool PDA
-            Some(pool_info.key), // freeze authority = pool PDA
+            pool_info.key, // mint authority = pool PDA
+            None,          // no freeze authority — LP tokens can never be frozen
             LP_MINT_DECIMALS,
         )?,
         std::slice::from_ref(lp_mint_info),

@@ -89,6 +89,9 @@ async fn happy_path_creates_all_pdas_and_persists_pool() {
     assert_eq!(lp_mint.supply, 0);
     let auth: Option<solana_program::pubkey::Pubkey> = lp_mint.mint_authority.into();
     assert_eq!(auth, Some(env.pool_pda().0));
+    // LP mint has NO freeze authority — LP tokens can never be frozen.
+    let freeze: Option<solana_program::pubkey::Pubkey> = lp_mint.freeze_authority.into();
+    assert_eq!(freeze, None);
 }
 
 #[tokio::test]
