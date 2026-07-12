@@ -25,7 +25,7 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     events::{Event, LoanOpened},
-    math::{band_id_for_trigger, mul_div, recompute_trigger, LoanSides, BPS_DENOM},
+    math::{band_id_for_trigger, ltv_bps, recompute_trigger, LoanSides},
     state::{
         bitmap_set, validate_token_program_for_mint, Loan, LoanIndexBand, Pool, BAND_SEED,
         LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR, LOAN_SEED, POOL_SEED,
@@ -116,20 +116,22 @@ pub fn process_open_loan(
     // the pool mid-price.
     //   CollateralA, DebtB:   ltv = debt * accounted_a / (collateral * accounted_b)
     //   CollateralB, DebtA:   ltv = debt * accounted_b / (collateral * accounted_a)
-    let ltv_bps = match sides {
-        LoanSides::CollateralA => mul_div(
-            (debt_amount as u128) * BPS_DENOM,
+    let loan_ltv_bps = match sides {
+        LoanSides::CollateralA => ltv_bps(
+            debt_amount as u128,
+            collateral_amount as u128,
             accounted_a,
-            (collateral_amount as u128) * accounted_b,
-        )?,
-        LoanSides::CollateralB => mul_div(
-            (debt_amount as u128) * BPS_DENOM,
             accounted_b,
-            (collateral_amount as u128) * accounted_a,
+        )?,
+        LoanSides::CollateralB => ltv_bps(
+            debt_amount as u128,
+            collateral_amount as u128,
+            accounted_b,
+            accounted_a,
         )?,
     };
-    if ltv_bps > pool.max_ltv_bps as u128 {
-        msg!("ltv_bps {} > max_ltv_bps {}", ltv_bps, pool.max_ltv_bps);
+    if loan_ltv_bps > pool.max_ltv_bps as u128 {
+        msg!("ltv_bps {} > max_ltv_bps {}", loan_ltv_bps, pool.max_ltv_bps);
         return Err(LiquidityError::LtvExceedsMax.into());
     }
 

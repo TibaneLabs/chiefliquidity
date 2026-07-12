@@ -192,6 +192,36 @@ pub fn bump_index_wad(
         .ok_or(LiquidityError::MathOverflow)
 }
 
+/// Loan-to-value ratio in basis points, using the pool mid-price to convert
+/// the debt token's value into the collateral token's units. Computed entirely
+/// in 256-bit space so no intermediate product can overflow `u128` (which,
+/// under `overflow-checks`, would abort the instruction rather than return a
+/// clean error).
+///
+/// `ltv_bps = debt * BPS_DENOM * price_num / (collateral * price_den)` where
+/// `(price_num, price_den)` are the accounted reserves for the conversion:
+///   - CollateralA, DebtB:  `price_num = accounted_a`, `price_den = accounted_b`
+///   - CollateralB, DebtA:  `price_num = accounted_b`, `price_den = accounted_a`
+pub fn ltv_bps(
+    debt_amount: u128,
+    collateral_amount: u128,
+    price_num: u128,
+    price_den: u128,
+) -> Result<u128, LiquidityError> {
+    let denom = U256::from_u128(collateral_amount)
+        .checked_mul(U256::from_u128(price_den))
+        .ok_or(LiquidityError::MathOverflow)?;
+    if denom.is_zero() {
+        return Err(LiquidityError::MathOverflow);
+    }
+    let num = U256::from_u128(debt_amount)
+        .checked_mul(U256::from_u128(BPS_DENOM))
+        .ok_or(LiquidityError::MathOverflow)?
+        .checked_mul(U256::from_u128(price_num))
+        .ok_or(LiquidityError::MathOverflow)?;
+    (num / denom).to_u128().ok_or(LiquidityError::MathOverflow)
+}
+
 /// Compute current owed: `principal * current_index / snapshot_index`.
 pub fn owed_from_index(
     principal: u128,
@@ -689,6 +719,48 @@ mod tests {
     fn test_bump_index_zero_inputs() {
         assert_eq!(bump_index_wad(WAD, 0, 1000).unwrap(), WAD);
         assert_eq!(bump_index_wad(WAD, WAD / 10, 0).unwrap(), WAD);
+    }
+
+    #[test]
+    fn test_ltv_bps_basic() {
+        // CollateralA/DebtB: debt 100 B, collateral 50 A, price 5 B per A
+        // (accounted_a=1000, accounted_b=5000).
+        // ltv = debt * accounted_a / (collateral * accounted_b)
+        //     = 100 * 1000 / (50 * 5000) = 100000 / 250000 = 0.4 → 4000 bps
+        let ltv = ltv_bps(100, 50, 1000, 5000).unwrap();
+        assert_eq!(ltv, 4000);
+    }
+
+    #[test]
+    fn test_ltv_bps_matches_naive_formula() {
+        // Cross-check against the plain-u128 formula over a range of inputs
+        // that stay well inside u128 (the whole point of the U256 version is
+        // to also handle the ones that don't — see the overflow test below).
+        for &(debt, coll, an, bn) in &[
+            (1u128, 1, 1, 1),
+            (100, 50, 1000, 5000),
+            (7, 3, 999, 1234),
+            (1_000_000, 999_999, 123_456, 654_321),
+        ] {
+            let expected = ((debt * BPS_DENOM) * an) / (coll * bn);
+            assert_eq!(ltv_bps(debt, coll, an, bn).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_ltv_bps_no_overflow_at_extremes() {
+        // collateral * price_den would overflow u128 in a naive computation;
+        // the U256 path must instead return a real value (here ~ 1 bps region).
+        let big = u128::from(u64::MAX);
+        let ltv = ltv_bps(big, big, big, big).unwrap();
+        // debt == collateral and price_num == price_den → ltv == BPS_DENOM.
+        assert_eq!(ltv, BPS_DENOM);
+    }
+
+    #[test]
+    fn test_ltv_bps_zero_denominator_errors() {
+        assert_eq!(ltv_bps(100, 0, 1000, 5000), Err(LiquidityError::MathOverflow));
+        assert_eq!(ltv_bps(100, 50, 1000, 0), Err(LiquidityError::MathOverflow));
     }
 
     #[test]
