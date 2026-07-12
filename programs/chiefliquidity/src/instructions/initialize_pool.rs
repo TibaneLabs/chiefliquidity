@@ -4,7 +4,7 @@
 //! validated mint pair. Pools are authority-less by construction — the stored
 //! `authority` is hardcoded to `Pubkey::default()`, so creating a pool grants
 //! no special rights and there is no pool admin to retune or drain it. Fee
-//! redemption is gated on the program's upgrade authority, not the pool.
+//! redemption is a permissionless crank that pays a fixed recipient, not the pool.
 
 use borsh::BorshSerialize;
 use solana_program::{
@@ -231,7 +231,7 @@ pub fn process_initialize_pool(
         vault_b: *vault_b_info.key,
         lp_mint: *lp_mint_info.key,
         // Authority-less: no one can retune, drain via a pool authority, or
-        // rotate. Fee redemption is gated on the program upgrade authority.
+        // rotate. Fee redemption is a permissionless crank to a fixed recipient.
         authority: Pubkey::default(),
         pool_bump,
         vault_a_bump,

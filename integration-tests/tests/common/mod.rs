@@ -696,9 +696,12 @@ impl TestEnv {
         .0
     }
 
+    /// Crank the permissionless `ClaimProtocolFees`. The instruction takes no
+    /// signer/authority account (`env.payer` merely funds the transaction); the
+    /// fees always route to `dest_a` / `dest_b`, which must be owned by
+    /// `PROTOCOL_FEE_RECIPIENT`.
     pub async fn claim_protocol_fees(
         &mut self,
-        authority: &Keypair,
         dest_a: &Pubkey,
         dest_b: &Pubkey,
     ) -> Result<(), TransportError> {
@@ -713,14 +716,12 @@ impl TestEnv {
                 AccountMeta::new(*dest_b, false),
                 AccountMeta::new_readonly(self.mint_a.pubkey(), false),
                 AccountMeta::new_readonly(self.mint_b.pubkey(), false),
-                AccountMeta::new_readonly(authority.pubkey(), true),
-                AccountMeta::new_readonly(self.program_data_pda(), false),
                 AccountMeta::new_readonly(self.token_program, false),
                 AccountMeta::new_readonly(self.token_program, false),
             ],
             data: borsh::to_vec(&data).unwrap(),
         };
-        self.send_with_new_blockhash(&[ix], &[authority]).await
+        self.send_with_new_blockhash(&[ix], &[]).await
     }
 
     /// Build + submit a ClaimLiquidatedRent instruction.

@@ -72,8 +72,10 @@ reproducible CI artifact (`CI` workflow → `chiefliquidity-verifiable`):
 | On-chain IDL | published (native/Borsh; explorers decode instructions + accounts) |
 | programdata size | 335072 bytes (tight — a larger upgrade needs `solana program extend`) |
 
-Fee redemption (`ClaimProtocolFees`) is gated on the **program's upgrade
-authority**, not any per-pool authority.
+Fee redemption (`ClaimProtocolFees`) is a **permissionless crank**: anyone may
+call it, and the accumulated protocol fees always route to the fixed recipient
+`23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj` (there is no per-pool or
+upgrade-authority gate).
 
 Maintainer workflow:
 

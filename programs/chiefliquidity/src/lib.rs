@@ -153,28 +153,26 @@ pub enum LiquidityInstruction {
     /// 11. `[]`        Token program for mint B
     RepayLoan,
 
-    /// Drain accumulated protocol fees from the vaults to the caller's token
-    /// accounts. Resets `protocol_fees_a` / `protocol_fees_b` to 0; no-op if
+    /// Drain accumulated protocol fees from the vaults to the fixed protocol-fee
+    /// recipient. Resets `protocol_fees_a` / `protocol_fees_b` to 0; no-op if
     /// both are already 0.
     ///
-    /// Gated on the **program's upgrade authority** (not a pool authority —
-    /// pools have none): the signer must equal the `upgrade_authority_address`
-    /// recorded in the program's ProgramData account. This ties fee redemption
-    /// to whoever controls the program, and follows automatically if the
-    /// upgrade authority is transferred.
+    /// **Permissionless crank**: no signer or authority is required. The
+    /// accumulated fees always route to token accounts owned by the hardcoded
+    /// `PROTOCOL_FEE_RECIPIENT` (`23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj`);
+    /// the caller only supplies those destination accounts and the program
+    /// verifies each is owned by the fixed recipient.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
     /// 1. `[writable]` Vault A
     /// 2. `[writable]` Vault B
-    /// 3. `[writable]` Recipient token A account
-    /// 4. `[writable]` Recipient token B account
+    /// 3. `[writable]` Recipient token A account (owned by `PROTOCOL_FEE_RECIPIENT`)
+    /// 4. `[writable]` Recipient token B account (owned by `PROTOCOL_FEE_RECIPIENT`)
     /// 5. `[]`         Mint A
     /// 6. `[]`         Mint B
-    /// 7. `[signer]`   Program upgrade authority (fee recipient)
-    /// 8. `[]`         Program ProgramData account (source of the upgrade authority)
-    /// 9. `[]`         Token program for mint A
-    /// 10. `[]`        Token program for mint B
+    /// 7. `[]`         Token program for mint A
+    /// 8. `[]`         Token program for mint B
     ClaimProtocolFees,
 
     /// Borrower-callable: reclaim the rent on a `Loan` that was liquidated

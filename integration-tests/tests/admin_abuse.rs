@@ -1,21 +1,22 @@
-//! Protocol-fee redemption tests (gated on the program upgrade authority) +
+//! Protocol-fee redemption tests (permissionless crank → fixed recipient) +
 //! cross-cutting abuse scenarios.
 //!
 //! Pools are immutable and authority-less — there is no TransferAuthority or
-//! UpdatePoolSettings anymore, so those tests are gone. Fee redemption is
-//! gated on the program's upgrade authority, which the harness seeds into an
-//! injected ProgramData account as `env.upgrade_authority`.
+//! UpdatePoolSettings anymore, so those tests are gone. Fee redemption is a
+//! permissionless crank: anyone may call it, and the fees always route to token
+//! accounts owned by the hardcoded `PROTOCOL_FEE_RECIPIENT`.
 
 mod common;
 
 use chiefliquidity::error::LiquidityError;
+use chiefliquidity::instructions::PROTOCOL_FEE_RECIPIENT;
 use common::{err_code, extract_custom_error, TestEnv};
 use solana_sdk::signature::Signer;
 
-// ============ ClaimProtocolFees (program-upgrade-authority gated) ============
+// ============ ClaimProtocolFees (permissionless crank → fixed recipient) ============
 
 #[tokio::test]
-async fn claim_protocol_fees_happy() {
+async fn claim_protocol_fees_permissionless_to_fixed_recipient() {
     let mut env = TestEnv::new().await;
     let _ = env
         .setup_pool_with_liquidity(1_000_000_000, 4_000_000_000)
@@ -31,26 +32,29 @@ async fn claim_protocol_fees_happy() {
     assert!(pool.protocol_fees_a > 0);
     let expected_a = pool.protocol_fees_a;
 
-    // The program's upgrade authority (not any pool authority) claims.
-    let auth = env.upgrade_authority.insecure_clone();
-    let dest_a = env.create_ata(&auth.pubkey(), &env.mint_a.pubkey()).await;
-    let dest_b = env.create_ata(&auth.pubkey(), &env.mint_b.pubkey()).await;
-    env.claim_protocol_fees(&auth, &dest_a, &dest_b)
-        .await
-        .unwrap();
+    // Destinations must be owned by the fixed recipient. ATA creation is itself
+    // permissionless, so anyone can set these up.
+    let dest_a = env
+        .create_ata(&PROTOCOL_FEE_RECIPIENT, &env.mint_a.pubkey())
+        .await;
+    let dest_b = env
+        .create_ata(&PROTOCOL_FEE_RECIPIENT, &env.mint_b.pubkey())
+        .await;
 
-    // Tokens landed in the upgrade authority's accounts.
+    // No authority required — the crank takes no signer account at all.
+    env.claim_protocol_fees(&dest_a, &dest_b).await.unwrap();
+
+    // Fees landed with the fixed recipient; counters reset.
     assert_eq!(env.token_balance(&dest_a).await, expected_a);
     assert_eq!(env.token_balance(&dest_b).await, 0);
 
-    // Pool counters reset.
     let pool_post = env.pool_state().await;
     assert_eq!(pool_post.protocol_fees_a, 0);
     assert_eq!(pool_post.protocol_fees_b, 0);
 }
 
 #[tokio::test]
-async fn claim_protocol_fees_non_upgrade_authority_rejected() {
+async fn claim_protocol_fees_wrong_recipient_rejected() {
     let mut env = TestEnv::new().await;
     let _ = env
         .setup_pool_with_liquidity(1_000_000_000, 4_000_000_000)
@@ -60,18 +64,18 @@ async fn claim_protocol_fees_non_upgrade_authority_rejected() {
         .await
         .unwrap();
 
-    // Anyone who is not the program upgrade authority is rejected — including
-    // the pool creator / fee payer (pools grant no authority).
+    // Destinations owned by anyone other than PROTOCOL_FEE_RECIPIENT are rejected
+    // — the crank can only ever pay the fixed recipient.
     let attacker = env.create_funded_user(10_000_000_000).await;
     let dest_a = env.create_ata(&attacker.pubkey(), &env.mint_a.pubkey()).await;
     let dest_b = env.create_ata(&attacker.pubkey(), &env.mint_b.pubkey()).await;
     let err = env
-        .claim_protocol_fees(&attacker, &dest_a, &dest_b)
+        .claim_protocol_fees(&dest_a, &dest_b)
         .await
         .unwrap_err();
     assert_eq!(
         extract_custom_error(&err),
-        Some(err_code(LiquidityError::InvalidAuthority))
+        Some(err_code(LiquidityError::InvalidFeeRecipient))
     );
 }
 

@@ -558,8 +558,8 @@
         5
       ],
       "docs": [
-        "Drain accumulated protocol fees from the vaults to the caller's token accounts and reset the counters. No-op if both fee counters are already 0.",
-        "Gated on the PROGRAM'S UPGRADE AUTHORITY (pools have none): the signer must equal the upgrade_authority_address in the program's ProgramData account. Reverts if the program is immutable (upgrade authority renounced)."
+        "Drain accumulated protocol fees from the vaults to the fixed protocol-fee recipient and reset the counters. No-op if both fee counters are already 0.",
+        "PERMISSIONLESS CRANK: no signer or authority is required. The fees always route to token accounts owned by the hardcoded PROTOCOL_FEE_RECIPIENT (23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj); the caller only supplies those destinations and the program verifies each is owned by the fixed recipient."
       ],
       "accounts": [
         {
@@ -587,14 +587,14 @@
           "name": "recipientTokenA",
           "writable": true,
           "docs": [
-            "Recipient token A account"
+            "Recipient token A account (must be owned by PROTOCOL_FEE_RECIPIENT)"
           ]
         },
         {
           "name": "recipientTokenB",
           "writable": true,
           "docs": [
-            "Recipient token B account"
+            "Recipient token B account (must be owned by PROTOCOL_FEE_RECIPIENT)"
           ]
         },
         {
@@ -607,19 +607,6 @@
           "name": "mintB",
           "docs": [
             "Mint B"
-          ]
-        },
-        {
-          "name": "upgradeAuthority",
-          "signer": true,
-          "docs": [
-            "Program upgrade authority (fee recipient)"
-          ]
-        },
-        {
-          "name": "programData",
-          "docs": [
-            "Program ProgramData account (source of the upgrade authority)"
           ]
         },
         {
@@ -670,7 +657,7 @@
         7
       ],
       "docs": [
-        "Swap with mandatory in-flight liquidation (DESIGN.md \u00a77).",
+        "Swap with mandatory in-flight liquidation (DESIGN.md §7).",
         "The caller supplies every band + all of its open loans whose liquidation the price move might trigger. The program iteratively reprices, liquidates the next crossed loan, and repeats, then quotes the swap on the post-liquidation reserves and commits only if min_out and the executable-reserve cap are satisfied.",
         "Beyond the 9 fixed accounts below, the instruction takes a variable tail: for each entry i in bandLoanCounts, one writable Band PDA followed by bandLoanCounts[i] writable Loan accounts (all of that band's open loans, sorted strictly ascending by pubkey)."
       ],
@@ -1574,6 +1561,11 @@
       "code": 39,
       "name": "Insolvent",
       "msg": "Pool is insolvent post-liquidation - real reserves cannot cover output"
+    },
+    {
+      "code": 40,
+      "name": "InvalidFeeRecipient",
+      "msg": "Protocol-fee destination is not owned by the fixed fee recipient"
     }
   ]
 }

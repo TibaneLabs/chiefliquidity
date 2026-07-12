@@ -177,7 +177,7 @@ pub struct Pool {
     pub last_update_slot: u64,           // 8
 
     // Treasury accounting
-    pub protocol_fees_a: u64,            // 8    skimmed; redeemable by the PROGRAM upgrade authority
+    pub protocol_fees_a: u64,            // 8    skimmed; drained by a permissionless crank to a fixed recipient
     pub protocol_fees_b: u64,            // 8
 
     // Band-presence bitmaps (see §6). Bit i set ↔ a LoanIndexBand PDA exists
@@ -202,9 +202,10 @@ Notes:
   `Pubkey::default()`. There is no `UpdatePoolSettings` or `TransferAuthority`.
   The config fields are retained in the struct (populated from the constants) for
   layout stability and so clients/explorers can still read the active values.
-- **Protocol fees are redeemable by the program's upgrade authority**, not any
-  per-pool authority: `ClaimProtocolFees` reads the program's ProgramData
-  account and requires the signer to equal its `upgrade_authority_address`.
+- **Protocol fees are drained by a permissionless crank to a fixed recipient.**
+  `ClaimProtocolFees` takes no signer or authority; the accumulated fees always
+  route to token accounts owned by the hardcoded `PROTOCOL_FEE_RECIPIENT`
+  (`23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj`), which the program verifies.
 - **The two sides may use different token programs.** A Token-2022 mint can be
   paired with a legacy SPL mint (e.g. a Token-2022 token / wSOL pool). Each
   instruction takes a `token_program_a` and a `token_program_b`, validated to be
@@ -569,9 +570,9 @@ Failure modes:
 7. **Authority model** — ✅ resolved. **Pools are immutable and authority-less**:
    `InitializePool` bakes in fixed economic constants and sets
    `authority = Pubkey::default()`; the creator gains no rights, and there is no
-   `TransferAuthority`/`UpdatePoolSettings`. The only privileged action is
-   `ClaimProtocolFees`, gated on the **program's upgrade authority** (read from
-   the program's ProgramData account) — not any per-pool authority.
+   `TransferAuthority`/`UpdatePoolSettings`. `ClaimProtocolFees` is a
+   **permissionless crank** — anyone may call it, and the fees always route to
+   the fixed `PROTOCOL_FEE_RECIPIENT`; there is no privileged actor at all.
 
 ---
 
@@ -589,7 +590,7 @@ Failure modes:
 | `instructions/open_loan.rs` | ✅ | Allocates band on first use; increments band count |
 | `instructions/repay_loan.rs` | ✅ | Decrements band count; refunds Loan + empty-Band rent |
 | `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |
-| `instructions/claim_protocol_fees.rs` | ✅ | Drain treasury; gated on the program upgrade authority (via ProgramData) |
+| `instructions/claim_protocol_fees.rs` | ✅ | Drain treasury; permissionless crank → fixed `PROTOCOL_FEE_RECIPIENT` |
 | `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |
 | `instructions/transfer_authority.rs` | ⊘ | **Removed** — pools are authority-less |
 | `instructions/update_pool_settings.rs` | ⊘ | **Removed** — pools are immutable (fixed constants) |
@@ -637,7 +638,7 @@ failure is swallowed so a dropped log line can never revert committed state.
 | `LoanRepaid` | `RepayLoan` | pool, loan, borrower, debt_principal, total_owed |
 | `LoanLiquidated` | `Swap` (per loan) | pool, loan, borrower, sides, collateral, debt, trigger |
 | `SwapExecuted` | `Swap` | pool, user, a_to_b, amount_in/out, liquidations, protocol_fee |
-| `ProtocolFeesClaimed` | `ClaimProtocolFees` | pool, authority (program upgrade authority), amount_a/b |
+| `ProtocolFeesClaimed` | `ClaimProtocolFees` | pool, recipient (fixed `PROTOCOL_FEE_RECIPIENT`), amount_a/b |
 | `LiquidatedRentClaimed` | `ClaimLiquidatedRent` | pool, loan, borrower |
 
 Discriminators are pinned and round-trip-tested in `events::tests`; they are

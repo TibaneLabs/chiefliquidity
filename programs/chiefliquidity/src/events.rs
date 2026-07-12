@@ -161,7 +161,8 @@ impl_event!(
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolFeesClaimed {
     pub pool: Pubkey,
-    pub authority: Pubkey,
+    /// The fixed protocol-fee recipient the tokens were routed to.
+    pub recipient: Pubkey,
     pub amount_a: u64,
     pub amount_b: u64,
 }
@@ -272,7 +273,7 @@ mod tests {
         });
         assert_wire_format(&ProtocolFeesClaimed {
             pool: Pubkey::new_unique(),
-            authority: Pubkey::new_unique(),
+            recipient: Pubkey::new_unique(),
             amount_a: 10,
             amount_b: 20,
         });

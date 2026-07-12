@@ -134,6 +134,10 @@ pub enum LiquidityError {
     // --- invariant violations (should not occur — sanity guards) ---
     #[error("Pool is insolvent post-liquidation - real reserves cannot cover output")]
     Insolvent,
+
+    // --- protocol fees ---
+    #[error("Protocol-fee destination is not owned by the fixed fee recipient")]
+    InvalidFeeRecipient,
 }
 
 impl From<LiquidityError> for ProgramError {

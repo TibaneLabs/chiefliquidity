@@ -1,11 +1,14 @@
-//! Drain accumulated protocol fees to the caller. Gated on the program's
-//! upgrade authority (read from the ProgramData account) — pools themselves
-//! have no authority.
+//! Drain accumulated protocol fees to the fixed protocol-fee recipient.
+//!
+//! This is a **permissionless crank**: anyone may call it (no signer or
+//! authority is required). The accumulated `protocol_fees_a` / `protocol_fees_b`
+//! are always routed to token accounts owned by [`PROTOCOL_FEE_RECIPIENT`] — the
+//! caller only supplies those destination accounts, and the program verifies
+//! each is owned by the fixed recipient before transferring.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
-    bpf_loader_upgradeable,
     clock::Clock,
     entrypoint::ProgramResult,
     msg,
@@ -13,13 +16,27 @@ use solana_program::{
     pubkey::Pubkey,
     sysvar::Sysvar,
 };
-use spl_token_2022::{extension::StateWithExtensions, state::Mint};
+use spl_token_2022::{
+    extension::StateWithExtensions,
+    state::{Account as TokenAccount, Mint},
+};
 
 use crate::{
     error::LiquidityError,
     events::{Event, ProtocolFeesClaimed},
     state::{validate_token_program_for_mint, Pool, POOL_SEED},
 };
+
+/// Fixed protocol-fee recipient (`23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj`).
+///
+/// `ClaimProtocolFees` is a permissionless crank; the accumulated fees always
+/// route to token accounts owned by this address, regardless of who calls it.
+pub const PROTOCOL_FEE_RECIPIENT: Pubkey = Pubkey::new_from_array([
+    0x0f, 0x73, 0xa5, 0xb7, 0xfa, 0x25, 0xa1, 0xbc,
+    0xf2, 0x49, 0x04, 0x9b, 0x55, 0xd9, 0x32, 0x09,
+    0x3d, 0xdc, 0x94, 0xcc, 0xc0, 0xb0, 0xf6, 0xb3,
+    0xb9, 0x17, 0xd0, 0x87, 0x6f, 0x1c, 0xe8, 0x86,
+]);
 
 pub fn process_claim_protocol_fees(
     program_id: &Pubkey,
@@ -34,51 +51,21 @@ pub fn process_claim_protocol_fees(
     let dest_b_info = next_account_info(it)?;
     let mint_a_info = next_account_info(it)?;
     let mint_b_info = next_account_info(it)?;
-    let authority_info = next_account_info(it)?;
-    let program_data_info = next_account_info(it)?;
     let token_program_a_info = next_account_info(it)?;
     let token_program_b_info = next_account_info(it)?;
 
-    if !authority_info.is_signer {
-        return Err(LiquidityError::MissingRequiredSigner.into());
-    }
     validate_token_program_for_mint(token_program_a_info, mint_a_info)?;
     validate_token_program_for_mint(token_program_b_info, mint_b_info)?;
     if pool_info.owner != program_id {
         return Err(LiquidityError::InvalidAccountOwner.into());
     }
 
-    // Gate on the program's UPGRADE authority (pools have no authority of their
-    // own). The ProgramData account for this program records the upgrade
-    // authority; the signer must equal it. Verify the passed account is the
-    // canonical ProgramData PDA and owned by the upgradeable loader first, so a
-    // spoofed account can't grant access.
-    let (expected_program_data, _) =
-        Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::id());
-    if *program_data_info.key != expected_program_data
-        || *program_data_info.owner != bpf_loader_upgradeable::id()
+    // Permissionless: no signer/authority gate. The only constraint is that the
+    // fees land in token accounts owned by the fixed recipient — verified below.
+    if read_token_owner(dest_a_info)? != PROTOCOL_FEE_RECIPIENT
+        || read_token_owner(dest_b_info)? != PROTOCOL_FEE_RECIPIENT
     {
-        return Err(LiquidityError::InvalidAccountOwner.into());
-    }
-    // UpgradeableLoaderState::ProgramData bincode layout:
-    //   [0..4]   u32 enum tag (== 3 for ProgramData)
-    //   [4..12]  u64 last-deployed slot
-    //   [12]     Option tag (1 = Some(upgrade_authority))
-    //   [13..45] Pubkey upgrade_authority (present iff tag == 1)
-    {
-        let pd = program_data_info.try_borrow_data()?;
-        if pd.len() < 45 || u32::from_le_bytes([pd[0], pd[1], pd[2], pd[3]]) != 3 {
-            return Err(LiquidityError::InvalidAccountOwner.into());
-        }
-        if pd[12] != 1 {
-            // Upgrade authority renounced → program is immutable → no claimant.
-            return Err(LiquidityError::AuthorityRenounced.into());
-        }
-        let upgrade_authority =
-            Pubkey::try_from(&pd[13..45]).map_err(|_| LiquidityError::InvalidAccountOwner)?;
-        if upgrade_authority != *authority_info.key {
-            return Err(LiquidityError::InvalidAuthority.into());
-        }
+        return Err(LiquidityError::InvalidFeeRecipient.into());
     }
 
     let mut pool = {
@@ -163,14 +150,14 @@ pub fn process_claim_protocol_fees(
     pool.serialize(&mut &mut data[..])?;
 
     msg!(
-        "ClaimProtocolFees a={} b={} authority={}",
+        "ClaimProtocolFees a={} b={} recipient={}",
         amount_a,
         amount_b,
-        authority_info.key
+        PROTOCOL_FEE_RECIPIENT
     );
     ProtocolFeesClaimed {
         pool: *pool_info.key,
-        authority: *authority_info.key,
+        recipient: PROTOCOL_FEE_RECIPIENT,
         amount_a,
         amount_b,
     }
@@ -185,4 +172,16 @@ fn read_mint_decimals(info: &AccountInfo) -> Result<u8, LiquidityError> {
     let state = StateWithExtensions::<Mint>::unpack(&data)
         .map_err(|_| LiquidityError::InvalidPoolMint)?;
     Ok(state.base.decimals)
+}
+
+/// Read the SPL token account's owner (the authority that controls it), used to
+/// prove a fee destination belongs to the fixed recipient. Works for both SPL
+/// Token and Token-2022 accounts (the base layout is shared).
+fn read_token_owner(info: &AccountInfo) -> Result<Pubkey, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<TokenAccount>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidFeeRecipient)?;
+    Ok(state.base.owner)
 }
