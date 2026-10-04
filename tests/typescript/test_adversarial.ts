@@ -469,50 +469,62 @@ async function run() {
   });
 
   await T('Inflation via remove-to-dust + donation cannot steal a depositor', async (ctx) => {
-    // The MIN_FIRST_DEPOSIT floor only gates the *first* deposit; it does NOT
-    // permanently lock a minimum LP supply the way Uniswap-v2's burned
-    // MINIMUM_LIQUIDITY does. So an attacker can satisfy the floor, then
-    // RemoveLiquidity back down to a single LP unit and donate raw tokens to
-    // inflate the share price — the classic first-depositor inflation setup,
-    // reached here via remove (the existing probe above keeps full supply, so
-    // it never exercises this path). The guarantee under test: a victim's
-    // deposit can never be pocketed for zero LP.
+    // Classic share-inflation setup: satisfy MIN_FIRST_DEPOSIT, RemoveLiquidity
+    // back down to a single LP unit, donate raw tokens to inflate the share
+    // price, then let floor-rounding of the next deposit's LP hand part of it
+    // to the attacker. Two defences are under test:
+    //   1. RemoveLiquidity enforces a MINIMUM_LIQUIDITY (1000) supply floor,
+    //      so the 1-unit state is unreachable through the program.
+    //   2. AddLiquidity charges a depositor only ceil(lp * reserve / supply)
+    //      per side, so even at the floor the victim pays exactly what the
+    //      LP it receives is worth.
+    const MINIMUM_LIQUIDITY = 1_000n;
     await ctx.initializePool();
     // One wallet plays the whole attack: seed capital + donation capital.
     const attacker = await ctx.newUser(10, 200_000_000n, 2_000_000n);
     await ctx.addLiquidity(attacker, 1_000_000n, 1_000_000n, 1n); // exactly MIN_FIRST_DEPOSIT
     assertEq(await ctx.lpSupply(), 1_000_000n, 'first deposit minted sqrt(1e6*1e6)');
 
-    // Drain supply to a single LP unit — the step the existing probe omits.
-    // Proves the supply floor is not permanent.
-    await ctx.removeLiquidity(attacker, 999_999n, 1n, 1n);
-    assertEq(await ctx.lpSupply(), 1n, 'supply driven to one LP unit via remove');
+    // Draining to a single LP unit is rejected by the supply floor.
+    await expectError(ctx.removeLiquidity(attacker, 999_999n, 1n, 1n),
+      Err.MinimumLiquidityFloor, 'remove leaving 1 LP unit');
+    assertEq(await ctx.lpSupply(), 1_000_000n, 'rejected remove committed nothing');
+
+    // The furthest the attacker can go is the floor itself.
+    await ctx.removeLiquidity(attacker, 1_000_000n - MINIMUM_LIQUIDITY, 1n, 1n);
+    assertEq(await ctx.lpSupply(), MINIMUM_LIQUIDITY, 'supply stops at the floor');
     await checkInvariants(ctx, connection);
 
-    // Inflate the share price: donate raw tokens straight to the vault so the
-    // lone LP unit now backs a huge A reserve (accounted_a ≫ accounted_b).
+    // Inflate the share price: donate raw tokens straight to vault A so each
+    // LP unit now backs ~1e5 A (accounted_a = 1000 + 1e8, accounted_b = 1000).
     await transfer(connection, payer, ctx.ata(attacker.publicKey, ctx.mintA), ctx.vaultA,
       attacker, 100_000_000n, [], { commitment: 'confirmed' }, ctx.tokenProgram);
     await checkInvariants(ctx, connection);
 
-    // Victim makes an ordinary balanced deposit. With accounted_a ~1e8 against
-    // supply=1, the proportional B side rounds to zero, so lp_to_mint is zero.
-    // The program MUST reject this rather than transfer the victim's tokens for
-    // no LP — that rejection is the entire anti-theft guarantee.
+    // Victim makes an ordinary 50M/50M deposit. B is clipped to the pool ratio
+    // (499), LP = 499 units, and A is charged ceil(499 * 100_001_000 / 1000)
+    // = 49_900_499 — exactly what 499 units are worth, not the full 50M.
     const victim = await ctx.newUser(10, 1_000_000_000n, 1_000_000_000n);
     const aBefore = await ctx.tokenBalance(victim.publicKey, ctx.mintA);
     const bBefore = await ctx.tokenBalance(victim.publicKey, ctx.mintB);
-    await expectError(ctx.addLiquidity(victim, 50_000_000n, 50_000_000n, 1n),
-      Err.ZeroAmount, 'donation-skewed deposit rounds to zero LP → reverts');
+    await ctx.addLiquidity(victim, 50_000_000n, 50_000_000n, 1n);
+    const victimLp = await ctx.tokenBalance(victim.publicKey, ctx.lpMint);
+    assertEq(victimLp, 499n, 'victim LP');
+    const paidA = aBefore - await ctx.tokenBalance(victim.publicKey, ctx.mintA);
+    const paidB = bBefore - await ctx.tokenBalance(victim.publicKey, ctx.mintB);
+    assertEq(paidA, 49_900_499n, 'victim charged only what its LP is worth (A)');
+    assertEq(paidB, 499n, 'victim charged only what its LP is worth (B)');
+    await checkInvariants(ctx, connection);
 
-    // The reverted tx committed nothing: no tokens left the victim.
-    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintA), aBefore, 'victim A untouched');
-    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintB), bBefore, 'victim B untouched');
+    // The victim's claim equals what it paid: exiting returns every unit.
+    // (Its burn leaves supply exactly at the floor, which is allowed.)
+    await ctx.removeLiquidity(victim, victimLp, 1n, 1n);
+    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintA), aBefore, 'victim A made whole');
+    assertEq(await ctx.tokenBalance(victim.publicKey, ctx.mintB), bBefore, 'victim B made whole');
 
-    // The grief is unprofitable: burning the last LP unwinds the pool and hands
-    // the inflated reserves back to the attacker, so they only ever locked their
-    // own donated capital — nothing was extracted from the victim.
-    await ctx.removeLiquidity(attacker, 1n, 1n, 1n);
+    // A sole LP can always fully exit: burning the floor to exactly zero is
+    // allowed and hands the donated reserves back to the attacker.
+    await ctx.removeLiquidity(attacker, MINIMUM_LIQUIDITY, 1n, 1n);
     assertEq(await ctx.lpSupply(), 0n, 'attacker burns last LP, pool fully unwound');
     const { a, b } = await ctx.vaultBalances();
     assert(a === 0n && b === 0n, `pool drained to empty, no value stranded (a=${a} b=${b})`);

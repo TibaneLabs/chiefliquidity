@@ -63,6 +63,44 @@ out_b ≤ real_b    (if B is the output side)
 
 Otherwise the entire transaction reverts.
 
+### LP shares (mint / burn rules)
+
+LP tokens are a pro-rata claim on `accounted_*` (so on outstanding debt too,
+never on collateral or protocol fees). Rounding always favours the pool.
+
+- **First deposit** (`lp_supply == 0`): both sides `≥ MIN_FIRST_DEPOSIT`
+  (1e6 base units); mints `sqrt(a·b) ≥ 1e6` LP. Any balance already in the
+  vaults (dust, donations, a debt claim left behind by holders who burned
+  their LP directly) is gifted to this depositor — only whoever left it loses.
+- **Later deposits**: `lp = floor(min(a/A, b/B) · S)`, and the depositor is
+  charged only `ceil(lp · A / S)` / `ceil(lp · B / S)` — what the minted LP is
+  worth, never more than the offered maxes. This is the load-bearing
+  share-inflation defence: however coarse an LP unit is made (tiny supply plus
+  a vault donation), floor-rounding `lp` can no longer move more than 1 base
+  unit per side from the depositor to existing holders. A deposit worth less
+  than one LP unit reverts (`ZeroAmount`).
+- **Supply floor** `MINIMUM_LIQUIDITY = 1000` (Uniswap-v2's constant, but as a
+  floor instead of a permanent burn so a sole LP can always fully exit):
+  `RemoveLiquidity` rejects (`MinimumLiquidityFloor`) a burn that would take
+  the supply from `≥ 1000` to `0 < S < 1000`; exiting to exactly 0 is allowed.
+  It keeps LP granularity fine on the normal path — inflating one LP unit to
+  value `V` requires parking `1000·V` in the pool, and only deposits smaller
+  than `D/1000` revert. It cannot be the sole defence because holders can burn
+  LP directly via the token program; pools already below the floor (legacy or
+  direct-burned) may still burn further so their LPs are never trapped.
+  Trade-off: the check is on total supply, so when the *other* holders own
+  fewer than 1000 units between them an LP can withdraw only down to the
+  floor and must leave the difference (< 1000 units) until they exit — the
+  recoverable analogue of Uniswap's permanently locked 1000 units.
+  A full exit through `RemoveLiquidity` needs `total_debt_a == total_debt_b ==
+  0` (it must be covered by swappable reserves), i.e. no open loans and no
+  earmarked collateral.
+- **Withdrawals** pay `floor(lp · accounted_x / S)` per side, gated by the
+  executable-reserve coverage check (`≤ swappable_x`). A burn whose output on a
+  side rounds to 0 while that side's accounted reserve is nonzero is rejected
+  (`ZeroAmount`); a side whose accounted reserve is genuinely 0 pays 0 so LPs
+  of such a pool can still withdraw the other side.
+
 ---
 
 ## 3. Loan trigger price (one number, two directions)
@@ -613,8 +651,8 @@ Failure modes:
 | `events.rs` | ✅ | Structured `sol_log_data` events (§11) |
 | `error.rs` | ✅ | |
 | `instructions/initialize_pool.rs` | ✅ | No args; bakes in fixed constants, `authority = default`, creates vaults + LP mint |
-| `instructions/add_liquidity.rs` | ✅ | |
-| `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate |
+| `instructions/add_liquidity.rs` | ✅ | Charges only what the minted LP is worth (§2 LP shares) |
+| `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate; `MINIMUM_LIQUIDITY` supply floor |
 | `instructions/open_loan.rs` | ✅ | Client-chosen nonce; allocates band on first use (or re-inits a zeroed one); increments band count |
 | `instructions/repay_loan.rs` | ✅ | Decrements band count (emptied band stays allocated); refunds Loan rent |
 | `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |

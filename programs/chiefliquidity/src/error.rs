@@ -138,6 +138,10 @@ pub enum LiquidityError {
     // --- protocol fees ---
     #[error("Protocol-fee destination is not owned by the fixed fee recipient")]
     InvalidFeeRecipient,
+
+    // --- LP supply ---
+    #[error("Withdrawal would leave LP supply below the minimum-liquidity floor")]
+    MinimumLiquidityFloor,
 }
 
 impl From<LiquidityError> for ProgramError {

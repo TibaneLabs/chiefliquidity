@@ -1566,6 +1566,11 @@
       "code": 40,
       "name": "InvalidFeeRecipient",
       "msg": "Protocol-fee destination is not owned by the fixed fee recipient"
+    },
+    {
+      "code": 41,
+      "name": "MinimumLiquidityFloor",
+      "msg": "Withdrawal would leave LP supply below the minimum-liquidity floor"
     }
   ]
 }

@@ -159,6 +159,8 @@ enum Err {
   BandFull = 37,
   TooManyLiquidationsRequired = 38,
   Insolvent = 39,
+  InvalidFeeRecipient = 40,
+  MinimumLiquidityFloor = 41,
 }
 
 const COLL_A = 0; // collateral A, debt B → OnFall

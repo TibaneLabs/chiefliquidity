@@ -18,6 +18,7 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     events::{Event, LiquidityRemoved},
+    instructions::add_liquidity::MINIMUM_LIQUIDITY,
     math::mul_div,
     state::{validate_token_program_for_mint, Pool, POOL_SEED},
 };
@@ -86,6 +87,7 @@ pub fn process_remove_liquidity(
     if (lp_amount as u128) > lp_supply {
         return Err(LiquidityError::MathUnderflow.into());
     }
+    check_supply_floor(lp_supply, lp_amount as u128)?;
 
     // Capitalize accrued interest into the indexes before computing the
     // LP's proportional share — withdrawals shrink the pool's accounted
@@ -95,8 +97,8 @@ pub fn process_remove_liquidity(
     let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;
     let (swappable_a, swappable_b) = pool.swappable(real_a, real_b)?;
 
-    let amount_a_out = mul_div(lp_amount as u128, accounted_a, lp_supply)?;
-    let amount_b_out = mul_div(lp_amount as u128, accounted_b, lp_supply)?;
+    let (amount_a_out, amount_b_out) =
+        withdrawal_amounts(lp_amount as u128, accounted_a, accounted_b, lp_supply)?;
 
     let amount_a_out_u64: u64 = amount_a_out
         .try_into()
@@ -204,12 +206,78 @@ pub fn process_remove_liquidity(
     Ok(())
 }
 
+/// Enforce the LP-supply floor (`MINIMUM_LIQUIDITY`): a burn may not take a
+/// pool from `supply >= MINIMUM_LIQUIDITY` to `0 < supply < MINIMUM_LIQUIDITY`.
+///
+/// - Exiting to exactly 0 is allowed, so a sole LP can always withdraw
+///   everything. That does not reopen share inflation: with supply 0 the next
+///   deposit is a first deposit minting `sqrt(a·b) >= MIN_FIRST_DEPOSIT` LP
+///   regardless of vault balances, so anything left in (or donated to) the
+///   vaults is gifted to that depositor — only the donor loses. Nothing else
+///   can be outstanding at supply 0 when it is reached through this
+///   instruction: a full exit withdraws `accounted = swappable + total_debt`
+///   and must pass the `<= swappable` coverage check, so it only succeeds
+///   with `total_debt_a == total_debt_b == 0`. Every open loan carries a
+///   nonzero principal (OpenLoan rejects zero debt; RepayLoan closes the loan
+///   in full), so zero total debt means zero open loans and therefore zero
+///   earmarked collateral — and collateral is excluded from `accounted`
+///   anyway, so a first depositor can neither claim it nor be diluted by it.
+///   (Supply 0 with loans still open is only reachable by holders burning
+///   LP directly through the token program; the outstanding debt claim is
+///   then gifted to the next first depositor, the collateral stays
+///   earmarked for its borrower — again only the burner loses.)
+/// - Pools already below the floor (created before it existed, or shrunk by
+///   holders burning LP directly through the token program, which no program
+///   check can prevent) are not frozen: burns from there are allowed so their
+///   LPs are never trapped. Deposits into such pools are still safe because
+///   `AddLiquidity` charges only for the LP actually minted.
+/// - Trade-off (chosen over Uniswap-v2's permanent burn of the first 1000
+///   units, which would break "a sole LP can always fully exit"): the floor
+///   is on total supply, so if the other holders own fewer than
+///   `MINIMUM_LIQUIDITY` units between them, an LP can only withdraw down to
+///   the floor and must leave `< MINIMUM_LIQUIDITY` units until they exit.
+fn check_supply_floor(lp_supply: u128, lp_amount: u128) -> Result<(), LiquidityError> {
+    let post_supply = lp_supply
+        .checked_sub(lp_amount)
+        .ok_or(LiquidityError::MathUnderflow)?;
+    let floor = MINIMUM_LIQUIDITY as u128;
+    if lp_supply >= floor && post_supply != 0 && post_supply < floor {
+        return Err(LiquidityError::MinimumLiquidityFloor);
+    }
+    Ok(())
+}
+
+/// Proportional share `floor(lp · accounted / supply)` of each side.
+///
+/// Rejects a burn whose output on a side rounds to 0 while that side has a
+/// nonzero accounted reserve: the LP would be burned for less than it is
+/// owed on that side. A side whose accounted reserve is genuinely 0 (e.g. all
+/// of it was lent out and then forgiven by a liquidation) legitimately pays
+/// 0 — rejecting that would trap every LP of such a pool, so it is allowed.
+/// The residual cost is that a holder of fewer than `supply / accounted_x`
+/// LP units cannot withdraw on their own; that position is worth less than
+/// one base unit of side x (and the pool-price equivalent on the other
+/// side), and can still be merged with more LP before burning.
+fn withdrawal_amounts(
+    lp_amount: u128,
+    accounted_a: u128,
+    accounted_b: u128,
+    lp_supply: u128,
+) -> Result<(u128, u128), LiquidityError> {
+    let amount_a_out = mul_div(lp_amount, accounted_a, lp_supply)?;
+    let amount_b_out = mul_div(lp_amount, accounted_b, lp_supply)?;
+    if (amount_a_out == 0 && accounted_a != 0) || (amount_b_out == 0 && accounted_b != 0) {
+        return Err(LiquidityError::ZeroAmount);
+    }
+    Ok((amount_a_out, amount_b_out))
+}
+
 fn read_mint_decimals(info: &AccountInfo) -> Result<u8, LiquidityError> {
     let data = info
         .try_borrow_data()
         .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-    let state = StateWithExtensions::<Mint>::unpack(&data)
-        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    let state =
+        StateWithExtensions::<Mint>::unpack(&data).map_err(|_| LiquidityError::InvalidPoolMint)?;
     Ok(state.base.decimals)
 }
 
@@ -217,8 +285,8 @@ fn read_mint_supply(info: &AccountInfo) -> Result<u128, LiquidityError> {
     let data = info
         .try_borrow_data()
         .map_err(|_| LiquidityError::AccountDataTooSmall)?;
-    let state = StateWithExtensions::<Mint>::unpack(&data)
-        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    let state =
+        StateWithExtensions::<Mint>::unpack(&data).map_err(|_| LiquidityError::InvalidPoolMint)?;
     Ok(state.base.supply as u128)
 }
 
@@ -229,4 +297,61 @@ fn read_token_amount(info: &AccountInfo) -> Result<u128, LiquidityError> {
     let state = StateWithExtensions::<TokenAccount>::unpack(&data)
         .map_err(|_| LiquidityError::InvalidVault)?;
     Ok(state.base.amount as u128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M: u128 = MINIMUM_LIQUIDITY as u128;
+
+    #[test]
+    fn floor_rejects_dust_supply() {
+        let supply = 1_000_000;
+        assert_eq!(
+            check_supply_floor(supply, supply - 1),
+            Err(LiquidityError::MinimumLiquidityFloor)
+        );
+        assert_eq!(
+            check_supply_floor(supply, supply - (M - 1)),
+            Err(LiquidityError::MinimumLiquidityFloor)
+        );
+        // Landing exactly on the floor is fine; so is a full exit.
+        assert_eq!(check_supply_floor(supply, supply - M), Ok(()));
+        assert_eq!(check_supply_floor(supply, supply), Ok(()));
+        assert_eq!(check_supply_floor(M, M), Ok(()));
+        assert_eq!(
+            check_supply_floor(M, 1),
+            Err(LiquidityError::MinimumLiquidityFloor)
+        );
+    }
+
+    #[test]
+    fn floor_does_not_trap_pools_already_below_it() {
+        // Legacy pool / directly-burned supply: LPs can still leave.
+        assert_eq!(check_supply_floor(M - 1, 1), Ok(()));
+        assert_eq!(check_supply_floor(500, 250), Ok(()));
+        assert_eq!(check_supply_floor(1, 1), Ok(()));
+    }
+
+    #[test]
+    fn zero_output_rejected_when_side_nonempty() {
+        // 100M A / 400M B, supply 200M: 1 LP → 0.5 A (rounds to 0).
+        assert_eq!(
+            withdrawal_amounts(1, 100_000_000, 400_000_000, 200_000_000),
+            Err(LiquidityError::ZeroAmount)
+        );
+        assert_eq!(
+            withdrawal_amounts(2, 100_000_000, 400_000_000, 200_000_000),
+            Ok((1, 4))
+        );
+    }
+
+    #[test]
+    fn genuinely_empty_side_pays_zero() {
+        // accounted_a == 0 (e.g. fully lent out, then forgiven by a
+        // liquidation): LPs must still be able to withdraw the other side.
+        assert_eq!(withdrawal_amounts(10, 0, 1_000, 100), Ok((0, 100)));
+        assert_eq!(withdrawal_amounts(100, 0, 1_000, 100), Ok((0, 1_000)));
+    }
 }
