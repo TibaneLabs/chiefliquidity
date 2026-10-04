@@ -335,7 +335,7 @@
       "docs": [
         "Open a collateralized loan. `sides` selects which token is collateral and which is debt.",
         "The program derives the trigger price and band id from the amounts and liqRatioBps, allocates the band on first use, and increments its membership count.",
-        "LTV check: debtValue / collateralValue <= maxLtvBps at the pool's accounted mid-price. `nonce` is client-chosen: any value whose Loan PDA is not yet initialized (pool.nextLoanNonce, still incremented per open, works too)."
+        "LTV check: debtValue / collateralValue <= maxLtvBps at BOTH the pool's accounted mid-price and its slot-sampled reference price (refPriceWad); the less favourable must pass. `nonce` is client-chosen: any value whose Loan PDA is not yet initialized (pool.nextLoanNonce, still incremented per open, works too)."
       ],
       "accounts": [
         {
@@ -1099,11 +1099,25 @@
             ]
           },
           {
+            "name": "refPriceWad",
+            "type": "u128",
+            "docs": [
+              "Manipulation-resistant B-per-A reference price (WAD): slot-sampled EMA of spot, 0 = unset."
+            ]
+          },
+          {
+            "name": "refPriceSlot",
+            "type": "u64",
+            "docs": [
+              "Slot of the last reference-price sample."
+            ]
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [
                 "u8",
-                32
+                8
               ]
             },
             "docs": [

@@ -234,14 +234,21 @@ pub struct Pool {
     pub band_bitmap_fall: [u8; 16],      // 16
     pub band_bitmap_rise: [u8; 16],      // 16
 
-    pub _reserved: [u8; 32],             // 32   forward-compat
+    // Manipulation-resistant reference price (see §12). Carved out of the
+    // original 32-byte `_reserved` tail; 0 = unset (all pre-existing pools).
+    pub ref_price_wad: u128,             // 16   slot-sampled EMA of spot B-per-A
+    pub ref_price_slot: u64,             // 8    slot of the last sample
+
+    pub _reserved: [u8; 8],              // 8    forward-compat
 }
 ```
 
 `LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×2 + 2) + 2×4 + (16×2 + 8)
-+ 8×3 + 8×2 + 16×2 + 32
++ 8×3 + 8×2 + 16×2 + (16 + 8 + 8)
 = 8 + 192 + 4 + 64 + 8 + 6 + 8 + 40 + 24 + 16 + 32 + 32 = **434 bytes**
-(verified by `state::tests::pool_size` borsh roundtrip).
+(verified by `state::tests::pool_size` borsh roundtrip; unchanged by the
+reference-price fields, which reuse the first 24 reserved bytes —
+`state::tests::ref_price_fields_occupy_old_reserved_tail`).
 
 Notes:
 - **Pools are immutable and authority-less.** `InitializePool` takes no
@@ -535,7 +542,8 @@ Algorithm:
 ```
 1. Load Pool, Vault A, Vault B; compute (real_a, real_b); bump borrow indexes.
 2. Compute (accounted_a, accounted_b) via Pool::accounted (collateral excluded,
-   outstanding debt included).
+   outstanding debt included). If this is the slot's first swap, fold the
+   pre-swap spot price into the reference-price EMA (§12).
 3. Determine direction (a→b lowers price → OnFall set; b→a raises it → OnRise).
 4. Parse the tail: per band, verify the set-membership completeness proof
    (§6.3.1) — count == k, strictly ascending distinct loans, matching band_id +
@@ -545,10 +553,20 @@ Algorithm:
    the next supplied loan whose trigger has crossed → liquidate it (accounting
    only: total_debt_x -= principal; total_collateral_y -= collateral) →
    recompute accounted reserves. Stop when none remain or the cap is hit.
-7. Compute final swap output against the post-liquidation accounted reserves.
+   post_price is the accounted price the pool will *actually* show once the
+   swap settles: the input side grows by `amount_in − protocol_skim` (the LP
+   share of the fee stays in reserves), the output side shrinks by
+   `amount_out`. (Pricing it with only the fee-reduced input would leave loans
+   whose trigger falls in that ~0.25% gap open after being crossed.)
+7. The final swap output is the loop's last quote (post-liquidation accounted
+   reserves); a zero output reverts (`ZeroAmount`) even when `min_out == 0`.
 8. Apply swap fee; accrue protocol_fee skim.
 9. Check: output ≤ swappable reserve (the solvency cap); check min_out.
-10. Post-cascade boundary recheck (§6.3.3).
+10. Post-cascade boundary recheck (§6.3.3), against the same settled
+    post_price the loop's last trigger scan used — so "no supplied loan
+    triggers at P" and "every populated band that could hold a loan
+    triggering at P was supplied" are statements about the same P, which is
+    exactly the pool's post-swap price.
 11. Tombstone liquidated loans (status=LIQUIDATED, amounts zeroed); decrement
     each touched band's count; clear the bitmap bit for any band that emptied.
 12. Transfer input from user → vault; transfer output from vault → user.
@@ -605,12 +623,13 @@ Failure modes:
    `UpdatePoolSettings`); the per-side indexes still evolve with utilization.
    Linear-within-bump accrual; compounding refinement deferred.
 3. **Oracle** — no external oracle in v1. Trigger prices are denominated in the
-   pool's own price (B-per-A). This means the *only* signal driving liquidation
-   is real swap activity. That's the design intent (§ project spec) but worth
-   double-checking against attack scenarios (is there an arbitrage vector that
-   lets you set up a loan that's instantly underwater but no one swaps to
-   trigger it? Probably not, since it'd be opened against the live pool price,
-   but worth a note).
+   pool's own price (B-per-A), so the *only* signal driving liquidation is real
+   swap activity. Opening a loan against the *spot* price alone was exploitable
+   (pump the price with a flash-loanable swap, borrow against the inflated
+   collateral, walk away) — `OpenLoan` now also checks LTV at an internal,
+   slot-sampled reference price (§12) and uses the less favourable of the two.
+   A loan can also never be opened already-liquidatable at spot (`max_ltv <
+   1/liq_ratio`, plus an explicit trigger check in `OpenLoan`).
 4. **Band scheme** — ✅ resolved. log2 buckets + bitmap index, shipped;
    `RebalanceBands` is retired (§6.6). The benchmark is now in place
    (`tests/typescript/test_benchmark.ts`): the worst-case cascade — 8
@@ -647,7 +666,7 @@ Failure modes:
 | File | Status | Notes |
 |------|--------|-------|
 | `state.rs` | ✅ | Accounts §5; `Pool` carries the §6 band bitmaps + §8 indexes |
-| `math.rs` | ✅ | CPMM quoting §8, trigger derivation §3, utilization-kink interest §8 |
+| `math.rs` | ✅ | CPMM quoting §8, trigger derivation §3, utilization-kink interest §8, reference-price EMA §12 |
 | `events.rs` | ✅ | Structured `sol_log_data` events (§11) |
 | `error.rs` | ✅ | |
 | `instructions/initialize_pool.rs` | ✅ | No args; bakes in fixed constants, `authority = default`, creates vaults + LP mint |
@@ -709,3 +728,59 @@ failure is swallowed so a dropped log line can never revert committed state.
 
 Discriminators are pinned and round-trip-tested in `events::tests`; they are
 disjoint from account discriminators (which lead with `0xa_`–`0xd_`).
+
+---
+
+## 12. Reference price (manipulation-resistant collateral valuation)
+
+**Problem.** Valuing collateral at the pool's spot price lets a borrower move
+that price within the same transaction. On a 1M A / 1M B pool, swapping 1M B in
+pumps B-per-A ≈ 4×; the ~500k A bought is then "worth" ~2M B, so an 80% LTV
+loan lends ~1.6M B against collateral really worth ~500k B. The borrower walks
+away, the price reverts, the loan is liquidated at a loss and LPs eat the bad
+debt. Any pump factor `k` with `max_ltv · √k > 1` pays, and a flash loan
+finances it.
+
+**Mechanism.** `Pool.ref_price_wad` is an exponential moving average of the
+spot price, sampled at most once per slot:
+
+- In `Swap`, *before* reserves move and before any liquidation, if
+  `clock.slot != ref_price_slot` the swap samples the pre-swap accounted spot
+  price `P` — i.e. the previous slot's closing price, which nothing in the
+  current slot has touched yet — and sets
+  `ref ← ref + (P − ref) · min(Δslots, H) / H` (`math::ema_ref_price_wad`),
+  `ref_price_slot ← slot`. Unset (`ref == 0`) seeds `ref ← P`. Later swaps in
+  the same slot do not sample, so an intra-slot pump never reaches the EMA.
+- `OpenLoan` computes LTV at **both** spot and the reference, and requires the
+  larger (less favourable) to be ≤ `max_ltv`. If no swap has happened yet this
+  slot, it uses the reference a dust swap would have produced
+  (`Pool::ref_price_at`) — identical to what the borrower could force anyway,
+  but without making honest borrowers wait for a trade. On a pool with no swap
+  since the upgrade (`ref == 0`) that is spot itself, which is safe: any swap
+  earlier in the same transaction would have seeded `ref` with its pre-swap
+  price first.
+- Trigger prices are untouched — they derive from the loan's own amounts.
+
+`H = REF_PRICE_WINDOW_SLOTS = 150` slots (~60 s). Each slot a manipulated price
+survives moves the reference by at most `1/H` of the manipulation; a price
+that has stood for `≥ H` slots is fully adopted.
+
+**Limits.**
+
+- A leader controlling consecutive slots can hold a pump across slot
+  boundaries without arbitrage and move the EMA by a bounded amount: over its
+  4-slot window, at most `1 − (1 − 1/H)^4 ≈ 2.7%` of the pump. Borrowing more
+  than the collateral is worth needs the reference inflated by
+  `1/max_ltv − 1 = 25%`, i.e. a ≥ ~10× pump (in CPMM, swapping in > 2× the
+  input-side reserve) held across slots with the attacker's own capital — no
+  flash loan spans slots. Longer holds are exposed to arbitrage throughout.
+- `H` trades responsiveness against resistance. Because `OpenLoan` takes the
+  *worse* of spot and reference, a lagging reference only ever tightens a
+  borrower's limit (for ~`H` slots after a genuine move); it never loosens it.
+- Accounted reserves also move on direct token donations to a vault. A
+  donation is an irrecoverable gift to LPs, and borrowing is capped by the
+  swappable reserve, so donation-inflated borrowing loses money for the donor
+  (borrow ≤ swappable ⇒ proceeds < collateral + donation).
+- The reference protects *opening* loans. Liquidation still keys off the
+  live post-swap price — by design, since that price is what the pool will
+  actually trade at.
