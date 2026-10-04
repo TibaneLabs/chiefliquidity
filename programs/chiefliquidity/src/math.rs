@@ -222,7 +222,14 @@ pub fn ltv_bps(
     (num / denom).to_u128().ok_or(LiquidityError::MathOverflow)
 }
 
-/// Compute current owed: `principal * current_index / snapshot_index`.
+/// Compute current owed: `ceil(principal * current_index / snapshot_index)`.
+///
+/// Rounds UP (in the protocol's favour): a floor here would let short or
+/// small loans repay less than they actually owe. Since `current ≥ snapshot`,
+/// the result is always `≥ principal`, and exactly `principal` when no
+/// interest has accrued (`current == snapshot`). Computed in 256-bit space;
+/// with `principal ≤ u64::MAX` and indexes bounded by [`INDEX_CAP_WAD`] the
+/// result always fits a `u128`.
 pub fn owed_from_index(
     principal: u128,
     snapshot_index_wad: u128,
@@ -235,7 +242,13 @@ pub fn owed_from_index(
         // Index can only grow; this is an invariant violation.
         return Err(LiquidityError::MathUnderflow);
     }
-    mul_div(principal, current_index_wad, snapshot_index_wad)
+    let prod = U256::from_u128(principal)
+        .checked_mul(U256::from_u128(current_index_wad))
+        .ok_or(LiquidityError::MathOverflow)?;
+    let snapshot = U256::from_u128(snapshot_index_wad);
+    let (q, r) = prod.div_mod(snapshot);
+    let q = if r.is_zero() { q } else { q + U256::one() };
+    q.to_u128().ok_or(LiquidityError::MathOverflow)
 }
 
 // ===== AMM quoting =====
@@ -771,6 +784,58 @@ mod tests {
         let snap = WAD;
         let cur = 3 * WAD / 2;
         assert_eq!(owed_from_index(principal, snap, cur).unwrap(), 150);
+    }
+
+    #[test]
+    fn test_owed_rounds_up() {
+        // Exact division: no rounding.
+        assert_eq!(owed_from_index(100, WAD, 2 * WAD).unwrap(), 200);
+        assert_eq!(owed_from_index(3, 2 * WAD, 4 * WAD).unwrap(), 6);
+        // Non-exact: rounds up, never down.
+        assert_eq!(owed_from_index(1, WAD, 2 * WAD - 1).unwrap(), 2);
+        assert_eq!(owed_from_index(1, WAD, WAD + 1).unwrap(), 2);
+        assert_eq!(owed_from_index(100, WAD, WAD + 1).unwrap(), 101);
+        // 13.33 → 14
+        assert_eq!(owed_from_index(10, 3 * WAD, 4 * WAD).unwrap(), 14);
+        // current == snapshot: exactly the principal, for any snapshot.
+        for &snap in &[WAD, WAD + 1, 7 * WAD / 3, INDEX_CAP_WAD] {
+            assert_eq!(owed_from_index(0, snap, snap).unwrap(), 0);
+            assert_eq!(owed_from_index(12_345, snap, snap).unwrap(), 12_345);
+            assert_eq!(
+                owed_from_index(u64::MAX as u128, snap, snap).unwrap(),
+                u64::MAX as u128
+            );
+        }
+        // Zero principal never owes anything.
+        assert_eq!(owed_from_index(0, WAD, INDEX_CAP_WAD).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_owed_rounds_up_large_values() {
+        let p = u64::MAX as u128;
+        // p * (WAD + 1) / WAD = p + p / WAD (+ fractional part → +1)
+        assert_eq!(owed_from_index(p, WAD, WAD + 1).unwrap(), p + p / WAD + 1);
+        // Large snapshot, exact ratio of 3/2.
+        let snap = INDEX_CAP_WAD / 2;
+        assert_eq!(
+            owed_from_index(p - 1, snap, snap / 2 * 3).unwrap(),
+            (p - 1) / 2 * 3
+        );
+        // Always within 1 of the floor result, and >= principal.
+        for &(pr, s, c) in &[
+            (p, WAD, 3 * WAD / 2 + 7),
+            (
+                123_456_789u128,
+                1_234_567_890_123_456_789,
+                9_876_543_210_987_654_321,
+            ),
+            (p, WAD + 12_345, INDEX_CAP_WAD - 1),
+        ] {
+            let floor = mul_div(pr, c, s).unwrap();
+            let ceil = owed_from_index(pr, s, c).unwrap();
+            assert!(ceil == floor || ceil == floor + 1);
+            assert!(ceil >= pr);
+        }
     }
 
     #[test]
