@@ -27,7 +27,7 @@ creation, there is no admin that can retune a pool, and creating a pool grants
 no special rights. Both **SPL Token** and **Token-2022** mints are supported;
 Token-2022 mints are restricted to an allowlist of extensions that are safe for
 the pool to custody (fee-on-transfer, transfer-hook, permanent-delegate, and the
-like are rejected).
+like are rejected; a mint close authority is accepted only if unset).
 
 See [`DESIGN.md`](DESIGN.md) for the on-chain design (account layouts, the
 band + bitmap loan-ordering index, the swap-with-liquidation algorithm, and the

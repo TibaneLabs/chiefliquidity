@@ -335,7 +335,7 @@
       "docs": [
         "Open a collateralized loan. `sides` selects which token is collateral and which is debt.",
         "The program derives the trigger price and band id from the amounts and liqRatioBps, allocates the band on first use, and increments its membership count.",
-        "LTV check: debtValue / collateralValue <= maxLtvBps at the pool's accounted mid-price. `nonce` must equal pool.nextLoanNonce."
+        "LTV check: debtValue / collateralValue <= maxLtvBps at the pool's accounted mid-price. `nonce` is client-chosen: any value whose Loan PDA is not yet initialized (pool.nextLoanNonce, still incremented per open, works too)."
       ],
       "accounts": [
         {
@@ -453,7 +453,7 @@
           "name": "nonce",
           "type": "u64",
           "docs": [
-            "Loan nonce; must equal pool.nextLoanNonce."
+            "Loan nonce; any value whose Loan PDA is free (client-chosen)."
           ]
         }
       ]
@@ -465,7 +465,7 @@
       ],
       "docs": [
         "Repay a loan in full (no partial repay in v1). Transfers principal + accrued interest back into the pool,",
-        "releases the collateral, decrements the band's count (refunding band rent if it empties), and marks the Loan repaid."
+        "releases the collateral, decrements the band's count (an emptied band stays allocated with count 0), and marks the Loan repaid."
       ],
       "accounts": [
         {
@@ -1050,7 +1050,7 @@
             "name": "nextLoanNonce",
             "type": "u64",
             "docs": [
-              "Next loan nonce to assign."
+              "Informational count of loans opened (nonces are client-chosen; not enforced)."
             ]
           },
           {

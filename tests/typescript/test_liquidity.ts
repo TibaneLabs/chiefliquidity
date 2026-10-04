@@ -579,7 +579,7 @@ class Ctx {
 
   /**
    * Open a loan. Computes nonce / trigger / band exactly as the program does.
-   * Pass `nonceOverride` to test stale-nonce rejection.
+   * Pass `nonceOverride` to open at a client-chosen nonce (any free one works).
    */
   async openLoan(
     borrower: Keypair,
@@ -1213,13 +1213,17 @@ async function runTests() {
         payer, 2_000_000_000n, [], { commitment: 'confirmed' }, tokenProgramId);
       await expectError(ctx.openLoan(borrower, COLL_A, 2_000_000_000n, 4_100_000_000n),
         Err.InsufficientExecutableLiquidity, 'debt beyond executable reserve');
-      // Stale nonce
+      // Nonces are client-chosen: an arbitrary (non-counter) nonce works...
+      const { nonce: freeNonce } =
+        await ctx.openLoan(borrower, COLL_A, 50_000_000n, 100_000_000n, { nonceOverride: 99n });
+      assertEq(freeNonce, 99n, 'arbitrary nonce accepted');
+      // ...but one whose Loan PDA is already in use is rejected.
       await expectError(
-        ctx.openLoan(borrower, COLL_A, 100_000_000n, 300_000_000n, { nonceOverride: 99n }),
-        Err.InvalidInstruction, 'wrong nonce');
+        ctx.openLoan(borrower, COLL_A, 50_000_001n, 100_000_000n, { nonceOverride: 99n }),
+        Err.AlreadyInitialized, 'nonce in use');
     });
 
-    await T('Repay loan: collateral back, band closed, accounting zeroed', async (ctx) => {
+    await T('Repay loan: collateral back, band emptied (kept allocated), accounting zeroed', async (ctx) => {
       await ctx.setupPoolWithLiquidity(1_000_000_000n, 4_000_000_000n);
       const borrower = await ctx.newUser(10, 100_000_000n, 50_000_000n);
       const { loan, bandId, direction } =
@@ -1231,7 +1235,8 @@ async function runTests() {
       assertEq(pool.totalDebtB, 0n, 'debt cleared');
       assertEq(pool.totalCollateralA, 0n, 'collateral cleared');
       assert(!bitmapIsSet(pool.bandBitmapFall, bandId), 'bit cleared');
-      assertEq(await ctx.bandState(direction, bandId), null, 'band PDA closed (rent refunded)');
+      // Emptied bands stay allocated (count 0) — closing them was a DoS vector.
+      assertEq((await ctx.bandState(direction, bandId))?.count, 0, 'band PDA kept, count 0');
       assertEq(await ctx.loanState(loan), null, 'loan account closed');
       const balA = await ctx.tokenBalance(borrower.publicKey, ctx.mintA);
       assertEq(balA, 100_000_000n, 'collateral returned');

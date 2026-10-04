@@ -10,6 +10,7 @@ use solana_program::{
     program_error::ProgramError, pubkey::Pubkey,
 };
 
+pub mod account_utils;
 pub mod error;
 pub mod events;
 pub mod instructions;
@@ -102,11 +103,14 @@ pub enum LiquidityInstruction {
     },
 
     /// Open a collateralized loan. Caller specifies the side (which token is
-    /// collateral, which is debt), the amounts, and the loan nonce (which
-    /// must equal `pool.next_loan_nonce`). Program computes the trigger
-    /// price and band id from the supplied amounts and `liq_ratio_bps`,
-    /// allocates the `LoanIndexBand` on first use, and increments its
-    /// membership `count`.
+    /// collateral, which is debt), the amounts, and the loan nonce. The nonce
+    /// is client-chosen: any value whose Loan PDA is not yet initialized is
+    /// accepted (a random u64, or `pool.next_loan_nonce` — still incremented
+    /// on every open as an informational counter — both work). Program
+    /// computes the trigger price and band id from the supplied amounts and
+    /// `liq_ratio_bps`, allocates the `LoanIndexBand` on first use, and
+    /// increments its membership `count`. Loan and band PDAs that were
+    /// pre-funded with lamports are adopted, not rejected.
     ///
     /// LTV check: debt_value / collateral_value ≤ `pool.max_ltv_bps`, with
     /// values converted via the pool's accounted mid-price.
@@ -120,7 +124,8 @@ pub enum LiquidityInstruction {
     /// 5. `[]`         Mint A
     /// 6. `[]`         Mint B
     /// 7. `[writable, signer]` Borrower (also the rent payer for new accounts)
-    /// 8. `[writable]` Loan PDA — `["loan", pool, borrower, nonce_le]`
+    /// 8. `[writable]` Loan PDA — `["loan", pool, borrower, nonce_le]` (must be
+    ///    uninitialized: no lamports, or a pre-funded system account)
     /// 9. `[writable]` Band PDA — `["band", pool, direction, band_id_le]`
     /// 10. `[]`        System program
     /// 11. `[]`        Token program for mint A
@@ -135,8 +140,8 @@ pub enum LiquidityInstruction {
     /// Repay a loan in full (no partial repay in v1). Transfers the
     /// principal-plus-accrued debt back into the pool, releases the
     /// collateral to the borrower, decrements the band's membership `count`
-    /// (refunding the band's rent if it empties), and marks the `Loan` as
-    /// repaid.
+    /// (an emptied band stays allocated with `count = 0` and its bitmap bit
+    /// cleared), marks the `Loan` as repaid, and refunds the `Loan` rent.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
@@ -146,7 +151,7 @@ pub enum LiquidityInstruction {
     /// 4. `[writable]` Borrower's token account B
     /// 5. `[]`         Mint A
     /// 6. `[]`         Mint B
-    /// 7. `[writable, signer]` Borrower
+    /// 7. `[writable, signer]` Borrower (receives the Loan's rent)
     /// 8. `[writable]` Loan
     /// 9. `[writable]` Band
     /// 10. `[]`        Token program for mint A

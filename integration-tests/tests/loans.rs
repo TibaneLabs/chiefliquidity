@@ -204,9 +204,19 @@ async fn repay_loan_full_round_trip() {
     assert_eq!(pool.total_debt_b, 0);
     assert_eq!(pool.total_collateral_a, 0);
 
-    // Loan + Band accounts are closed (rent refunded).
+    // Loan is closed (rent refunded). The emptied band is NOT closed: it stays
+    // allocated with count 0 and its bitmap bit cleared (closing it was a DoS
+    // vector — see DESIGN.md §5.3).
     let (loan_pda, _) = env.loan_pda(&borrower.pubkey(), nonce);
     assert!(env.loan_state(&loan_pda).await.is_none());
+    let (_, band_id, dir) = env.loan_band(COLL_A, 100_000_000, 200_000_000);
+    let band = env.band_state(dir, band_id).await.expect("band stays allocated");
+    assert!(band.is_initialized());
+    assert_eq!(band.count, 0);
+    assert!(!chiefliquidity::state::bitmap_is_set(
+        pool.band_bitmap(dir).unwrap(),
+        band_id
+    ));
 }
 
 #[tokio::test]

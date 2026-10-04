@@ -4,6 +4,12 @@
 //! use, incrementing its membership `count` (and setting the Pool band bitmap
 //! when the band goes from empty to populated). Updates `pool.total_debt_x`,
 //! `pool.total_collateral_y`, `pool.open_loans`, `pool.next_loan_nonce`.
+//!
+//! The loan `nonce` is client-chosen: any value whose Loan PDA
+//! `["loan", pool, borrower, nonce]` is still free is accepted (the PDA is
+//! already unique per borrower, so there is no pool-wide ordering to contend
+//! on). `pool.next_loan_nonce` is still incremented as an informational
+//! counter, so clients that pass it keep working.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -23,6 +29,7 @@ use spl_token_2022::{
 };
 
 use crate::{
+    account_utils::{create_pda_account, is_zeroed_program_account},
     error::LiquidityError,
     events::{Event, LoanOpened},
     math::{band_id_for_trigger, ltv_bps, recompute_trigger, LoanSides},
@@ -83,10 +90,6 @@ pub fn process_open_loan(
     {
         return Err(LiquidityError::InvalidPool.into());
     }
-    if nonce != pool.next_loan_nonce {
-        return Err(LiquidityError::InvalidInstruction.into());
-    }
-
     let sides = LoanSides::from_u8(sides_byte)?;
 
     // Bump per-side borrow indexes BEFORE reading anything that depends on
@@ -158,6 +161,9 @@ pub fn process_open_loan(
     if *band_info.key != expected_band {
         return Err(LiquidityError::BandMismatch.into());
     }
+    // Any free nonce is accepted. A Loan PDA carrying data — live, tombstoned,
+    // or a closed-then-revived all-zero account — is never (re)initialized;
+    // the borrower simply picks another nonce.
     if !loan_info.data_is_empty() {
         return Err(LiquidityError::AlreadyInitialized.into());
     }
@@ -174,23 +180,23 @@ pub fn process_open_loan(
         &nonce_le,
         std::slice::from_ref(&loan_bump),
     ];
-    invoke_signed(
-        &system_instruction::create_account(
-            borrower_info.key,
-            loan_info.key,
-            rent.minimum_balance(Loan::LEN),
-            Loan::LEN as u64,
-            program_id,
-        ),
-        &[
-            borrower_info.clone(),
-            loan_info.clone(),
-            system_program_info.clone(),
-        ],
-        &[loan_seeds],
+    create_pda_account(
+        borrower_info,
+        loan_info,
+        system_program_info,
+        Loan::LEN,
+        program_id,
+        loan_seeds,
+        &rent,
     )?;
 
     // ---- Allocate Band on first use ----
+    // Three cases: (1) no account / pre-funded system account → create it;
+    // (2) a program-owned, exactly band-sized, all-zero account → (re)init in
+    // place. That is a band closed by a pre-fix `RepayLoan` whose lamports were
+    // topped back up within the same tx; bands are no longer closed, but such
+    // accounts may exist on mainnet and must stay usable; (3) otherwise it is a
+    // live band, validated below.
     let band_id_le = band_id.to_le_bytes();
     let band_seeds: &[&[u8]] = &[
         BAND_SEED,
@@ -199,22 +205,37 @@ pub fn process_open_loan(
         &band_id_le,
         std::slice::from_ref(&band_bump),
     ];
-    if band_info.data_is_empty() {
-        invoke_signed(
-            &system_instruction::create_account(
-                borrower_info.key,
-                band_info.key,
-                rent.minimum_balance(LoanIndexBand::LEN),
-                LoanIndexBand::LEN as u64,
-                program_id,
-            ),
-            &[
-                borrower_info.clone(),
-                band_info.clone(),
-                system_program_info.clone(),
-            ],
-            &[band_seeds],
+    let band_is_new = band_info.data_is_empty();
+    let band_is_zeroed =
+        !band_is_new && is_zeroed_program_account(band_info, program_id, LoanIndexBand::LEN);
+    if band_is_new {
+        create_pda_account(
+            borrower_info,
+            band_info,
+            system_program_info,
+            LoanIndexBand::LEN,
+            program_id,
+            band_seeds,
+            &rent,
         )?;
+    } else if band_is_zeroed {
+        // Keep the revived account rent-exempt (it already was, or the
+        // reviving tx would have failed the runtime rent check).
+        let missing = rent
+            .minimum_balance(LoanIndexBand::LEN)
+            .saturating_sub(band_info.lamports());
+        if missing > 0 {
+            invoke(
+                &system_instruction::transfer(borrower_info.key, band_info.key, missing),
+                &[
+                    borrower_info.clone(),
+                    band_info.clone(),
+                    system_program_info.clone(),
+                ],
+            )?;
+        }
+    }
+    if band_is_new || band_is_zeroed {
         let new_band = LoanIndexBand {
             discriminator: LOAN_INDEX_BAND_DISCRIMINATOR,
             pool: *pool_info.key,

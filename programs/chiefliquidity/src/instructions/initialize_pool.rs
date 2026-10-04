@@ -16,15 +16,18 @@ use solana_program::{
     program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
     sysvar::Sysvar,
 };
 use spl_token_2022::{
-    extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
+    extension::{
+        mint_close_authority::MintCloseAuthority, BaseStateWithExtensions, ExtensionType,
+        StateWithExtensions,
+    },
     state::Mint,
 };
 
 use crate::{
+    account_utils::create_pda_account,
     error::LiquidityError,
     events::{Event, PoolInitialized},
     math::BPS_DENOM,
@@ -164,21 +167,16 @@ pub fn process_initialize_pool(
         mint_b_info.key.as_ref(),
         &[pool_bump],
     ];
-    let pool_rent = rent.minimum_balance(Pool::LEN);
-    invoke_signed(
-        &system_instruction::create_account(
-            authority_info.key,
-            pool_info.key,
-            pool_rent,
-            Pool::LEN as u64,
-            program_id,
-        ),
-        &[
-            authority_info.clone(),
-            pool_info.clone(),
-            system_program_info.clone(),
-        ],
-        &[pool_seeds],
+    // Tolerates a pre-funded PDA (see `account_utils`), so a dust transfer to
+    // the predictable pool address cannot block pool creation for this pair.
+    create_pda_account(
+        authority_info,
+        pool_info,
+        system_program_info,
+        Pool::LEN,
+        program_id,
+        pool_seeds,
+        &rent,
     )?;
 
     // ---- Create Vault A & B (SPL token accounts owned by Pool PDA) ----
@@ -299,8 +297,14 @@ pub fn process_initialize_pool(
 /// through a denylist.
 ///
 /// Permitted (none affect transferability or the raw amounts the vaults track):
-///   - `MintCloseAuthority`  — can only close at zero supply, impossible while a
-///     pool holds the token.
+///   - `MintCloseAuthority` — **only with no close authority set** (`None`).
+///     A set close authority is rejected: a pool can sit at zero balance (e.g.
+///     before its first deposit or after full withdrawal), so the mint could be
+///     closed at zero supply and re-created at the same address with banned
+///     extensions (PermanentDelegate, TransferHook, TransferFee), different
+///     decimals, or under a different token program — after the pool already
+///     validated it. Token-2022 never lets an unset close authority be set
+///     later, so `None` is permanent.
 ///   - `InterestBearingConfig` — scales only the *UI* amount; raw amounts, and
 ///     therefore all vault/AMM accounting, are unchanged.
 ///   - metadata extensions (`MetadataPointer`, `TokenMetadata`, and the token
@@ -334,7 +338,13 @@ fn validate_mint_extensions(mint_info: &AccountInfo, token_program: &Pubkey) -> 
     let state = StateWithExtensions::<Mint>::unpack(&data)?;
 
     for ext in state.get_extension_types()? {
-        if !MINT_EXTENSION_ALLOWLIST.contains(&ext) {
+        let allowed = MINT_EXTENSION_ALLOWLIST.contains(&ext)
+            && (ext != ExtensionType::MintCloseAuthority
+                || Option::<Pubkey>::from(
+                    state.get_extension::<MintCloseAuthority>()?.close_authority,
+                )
+                .is_none());
+        if !allowed {
             msg!(
                 "mint {} has non-allowlisted extension {:?} — rejected",
                 mint_info.key,
@@ -367,22 +377,14 @@ fn create_vault<'a>(
     } else {
         spl_token_2022::state::Account::LEN
     };
-    let vault_rent = rent.minimum_balance(vault_size);
-
-    invoke_signed(
-        &system_instruction::create_account(
-            payer_info.key,
-            vault_info.key,
-            vault_rent,
-            vault_size as u64,
-            token_program_info.key,
-        ),
-        &[
-            payer_info.clone(),
-            vault_info.clone(),
-            system_program_info.clone(),
-        ],
-        &[seeds],
+    create_pda_account(
+        payer_info,
+        vault_info,
+        system_program_info,
+        vault_size,
+        token_program_info.key,
+        seeds,
+        rent,
     )?;
 
     invoke_signed(
@@ -417,22 +419,14 @@ fn create_lp_mint<'a>(
     } else {
         spl_token_2022::state::Mint::LEN
     };
-    let mint_rent = rent.minimum_balance(mint_size);
-
-    invoke_signed(
-        &system_instruction::create_account(
-            payer_info.key,
-            lp_mint_info.key,
-            mint_rent,
-            mint_size as u64,
-            token_program_info.key,
-        ),
-        &[
-            payer_info.clone(),
-            lp_mint_info.clone(),
-            system_program_info.clone(),
-        ],
-        &[seeds],
+    create_pda_account(
+        payer_info,
+        lp_mint_info,
+        system_program_info,
+        mint_size,
+        token_program_info.key,
+        seeds,
+        rent,
     )?;
 
     invoke_signed(

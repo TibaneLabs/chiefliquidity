@@ -116,6 +116,16 @@ PDAs (seed conventions match `../chiefstaker` — `pub const FOO_SEED: &[u8] = b
 
 Mints sorted lexicographically so `(A, B)` and `(B, A)` produce the same pool.
 
+Every one of these addresses is predictable, so anyone can "pre-fund" one with a
+dust lamport transfer before it is created. `system_instruction::create_account`
+refuses a target that already holds lamports, which would let such a transfer
+permanently block a pool, its vaults / LP mint, a band, or a borrower's next
+loan. All creation therefore goes through `account_utils::create_pda_account`:
+an empty address gets a plain `create_account`; a pre-funded **system-owned,
+data-less** address is topped up to rent-exemption (only the missing lamports)
+and then `allocate`d + `assign`ed under the PDA's seeds; anything else is an
+existing account (`AlreadyInitialized`).
+
 ---
 
 ## 5. Account layouts
@@ -173,7 +183,7 @@ pub struct Pool {
 
     // Counters
     pub open_loans: u64,                 // 8
-    pub next_loan_nonce: u64,            // 8    pool-monotonic; see §5.3
+    pub next_loan_nonce: u64,            // 8    informational open counter; see §5.2
     pub last_update_slot: u64,           // 8
 
     // Treasury accounting
@@ -212,7 +222,10 @@ Notes:
   a supported token program that owns the respective mint; every token CPI
   targets the program for that side. Vault A and the LP mint are created under
   program A, vault B under program B. Token-2022 mints on either side are still
-  gated by the extension allowlist (§ `initialize_pool.rs`).
+  gated by the extension allowlist (§ `initialize_pool.rs`). `MintCloseAuthority`
+  is accepted only with **no** close authority set: a pool can sit at zero
+  balance, so a closable mint could be closed and re-created at the same
+  address with banned extensions, other decimals, or another token program.
 - The interest model stores the four-parameter utilization-kink curve plus the
   two per-side borrow indexes that capitalize accrued interest lazily — see §8.
   The parameters are fixed at the program constants; the indexes still evolve.
@@ -229,7 +242,15 @@ Notes:
 ### 5.2 `Loan`
 
 A loan is one position. Stored at `["loan", pool, borrower, nonce]` so a borrower
-may hold multiple positions.
+may hold multiple positions. The `nonce` is **client-chosen**: `OpenLoan`
+accepts any value whose Loan PDA is not yet initialized (empty, or a pre-funded
+system account). The PDA is already unique per borrower, so there is no
+pool-wide sequence to contend on — concurrent borrowers never collide, and no
+one can lock a borrower out by bumping a shared counter. `pool.next_loan_nonce`
+is still incremented on every open as an informational counter, so clients that
+pass it keep working. A Loan PDA that carries any data (live, liquidated
+tombstone, or a closed account revived as all-zero) is never re-initialized —
+the borrower just picks another nonce.
 
 ```rust
 pub struct Loan {
@@ -238,7 +259,7 @@ pub struct Loan {
     // Identity / back-references
     pub pool: Pubkey,                    // 32
     pub borrower: Pubkey,                // 32
-    pub nonce: u64,                      // 8    pool.next_loan_nonce at create time
+    pub nonce: u64,                      // 8    client-chosen at create time
     pub bump: u8,                        // 1
 
     // Sides — encoded as a single byte for compactness
@@ -310,11 +331,17 @@ pub struct LoanIndexBand {
 and on each in-swap liquidation. A loan never changes band (its trigger price is
 immutable), so `count` is an exact, drift-free tally of the band's membership —
 which is all the completeness proof in §6 needs. When `count` reaches 0 the
-band's bit in the Pool bitmap is cleared; `RepayLoan` additionally closes the
-PDA and refunds its rent, while a swap that empties a band leaves the PDA
-allocated (`count = 0`). The bitmap — not PDA existence — is therefore the
-source of truth for "populated", and `OpenLoan` sets the bit whenever `count`
-goes 0 → 1 (covering both a fresh PDA and a swap-emptied one being reused).
+band's bit in the Pool bitmap is cleared, but the PDA is **never closed** —
+both `RepayLoan` and a swap that empties a band leave it allocated
+(`count = 0`). (Earlier builds closed it in `RepayLoan`; that was unsafe: the
+drained account could be topped back up within the same transaction, leaving a
+program-owned all-zero band that `OpenLoan` could never reuse, and the rent went
+to whoever repaid last rather than to whoever had paid it.) The bitmap — not PDA
+existence — is therefore the source of truth for "populated", and `OpenLoan`
+sets the bit whenever `count` goes 0 → 1 (covering both a fresh PDA and an
+emptied one being reused). `OpenLoan` also treats a program-owned, exactly
+band-sized, all-zero account at the band PDA as uninitialized and initializes it
+in place, so bands revived under the old closing behaviour become usable again.
 
 ---
 
@@ -563,10 +590,11 @@ Failure modes:
    until a concrete >8-at-one-price clustering scenario justifies it.
 5. **Multi-hop / Jupiter integration** — completely deferred. Routers will need
    a "preview liquidation context" RPC; design when we get there.
-6. **Borrower nonce** — using a per-pool monotonic `next_loan_nonce` keeps loan
-   PDAs unique even if a borrower opens & closes repeatedly. Closed loan
-   accounts can be `lamport-zeroed` and reused via realloc, or kept as history.
-   Lean toward closing them (refund rent) and incrementing the pool nonce.
+6. **Borrower nonce** — ✅ resolved. The nonce is client-chosen (any free Loan
+   PDA); requiring `nonce == pool.next_loan_nonce` made concurrent borrowers
+   collide and let a spammer keep bumping the counter to lock others out.
+   Repaid loans are closed (rent refunded); `next_loan_nonce` survives only as
+   an informational counter (§5.2).
 7. **Authority model** — ✅ resolved. **Pools are immutable and authority-less**:
    `InitializePool` bakes in fixed economic constants and sets
    `authority = Pubkey::default()`; the creator gains no rights, and there is no
@@ -587,8 +615,8 @@ Failure modes:
 | `instructions/initialize_pool.rs` | ✅ | No args; bakes in fixed constants, `authority = default`, creates vaults + LP mint |
 | `instructions/add_liquidity.rs` | ✅ | |
 | `instructions/remove_liquidity.rs` | ✅ | Executable-reserve coverage gate |
-| `instructions/open_loan.rs` | ✅ | Allocates band on first use; increments band count |
-| `instructions/repay_loan.rs` | ✅ | Decrements band count; refunds Loan + empty-Band rent |
+| `instructions/open_loan.rs` | ✅ | Client-chosen nonce; allocates band on first use (or re-inits a zeroed one); increments band count |
+| `instructions/repay_loan.rs` | ✅ | Decrements band count (emptied band stays allocated); refunds Loan rent |
 | `instructions/swap.rs` | ✅ | §7 + in-flight liquidation cascade |
 | `instructions/claim_protocol_fees.rs` | ✅ | Drain treasury; permissionless crank → fixed `PROTOCOL_FEE_RECIPIENT` |
 | `instructions/claim_liquidated_rent.rs` | ✅ | Borrower reclaims tombstone rent |

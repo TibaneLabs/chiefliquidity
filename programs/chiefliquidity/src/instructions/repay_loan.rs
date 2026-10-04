@@ -4,8 +4,15 @@
 //! accrued` of the debt token from the borrower into the vault, transfers
 //! `collateral_amount` of the collateral token from the vault back to the
 //! borrower, decrements the loan's band membership `count` (clearing the Pool
-//! band bitmap bit and refunding the band's rent if it became empty), marks the
-//! `Loan` as repaid, and refunds the `Loan` rent to the borrower.
+//! band bitmap bit if it became empty), marks the `Loan` as repaid, and refunds
+//! the `Loan` rent to the borrower.
+//!
+//! An emptied band is deliberately **left allocated** (`count = 0`), exactly as
+//! a swap that liquidates a band's last loan leaves it; `OpenLoan` re-populates
+//! it in place. Closing it here was unsafe: an attacker could top the drained
+//! account back up within the same transaction, leaving a program-owned,
+//! all-zero band that `OpenLoan` could never reuse — and the band's rent went
+//! to whoever repaid last rather than to whoever had paid it.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -259,13 +266,13 @@ pub fn process_repay_loan(
         .ok_or(LiquidityError::MathUnderflow)?;
 
     let band_now_empty = band.count == 0;
-    if !band_now_empty {
+    if band_now_empty {
+        // Band is empty — clear its presence bit, but keep the PDA allocated.
+        bitmap_clear(pool.band_bitmap_mut(band.direction)?, band.band_id)?;
+    }
+    {
         let mut data = band_info.try_borrow_mut_data()?;
         band.serialize(&mut &mut data[..])?;
-    } else {
-        // Band is empty — clear its presence bit and refund its rent.
-        bitmap_clear(pool.band_bitmap_mut(band.direction)?, band.band_id)?;
-        close_account(band_info, borrower_info)?;
     }
 
     // Mark Loan as repaid and close (refund rent).

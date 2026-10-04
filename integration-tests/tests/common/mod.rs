@@ -33,7 +33,8 @@ use spl_associated_token_account::{
     get_associated_token_address_with_program_id, instruction::create_associated_token_account,
 };
 use spl_token_2022::{
-    extension::StateWithExtensions, instruction as token_ix,
+    extension::StateWithExtensions,
+    instruction as token_ix,
     state::{Account as TokenAccount, Mint},
 };
 
@@ -94,6 +95,15 @@ impl TestEnv {
     /// fresh Token-2022 mints with `payer` as mint authority. Mints are
     /// sorted so `mint_a < mint_b`.
     pub async fn new() -> Self {
+        Self::new_with_accounts(|_, _| Vec::new()).await
+    }
+
+    /// Like `new`, but `preload(mint_a, mint_b)` returns extra accounts to
+    /// inject into the bank at genesis (e.g. a pre-existing account at a PDA
+    /// derived from the pool), keyed off the already-sorted mint pubkeys.
+    pub async fn new_with_accounts(
+        preload: impl FnOnce(&Pubkey, &Pubkey) -> Vec<(Pubkey, Account)>,
+    ) -> Self {
         let program_id = chiefliquidity::id();
         let mut program_test = ProgramTest::new(
             "chiefliquidity",
@@ -131,14 +141,17 @@ impl TestEnv {
             },
         );
 
-        let (mut banks_client, payer, last_blockhash) = program_test.start().await;
-
         // Generate two mints, sort by pubkey so mint_a < mint_b.
         let mut a = Keypair::new();
         let mut b = Keypair::new();
         if a.pubkey().as_ref() > b.pubkey().as_ref() {
             std::mem::swap(&mut a, &mut b);
         }
+        for (key, account) in preload(&a.pubkey(), &b.pubkey()) {
+            program_test.add_account(key, account);
+        }
+
+        let (mut banks_client, payer, last_blockhash) = program_test.start().await;
 
         let token_program = spl_token_2022::id();
         let mint_a_decimals = 9;
@@ -183,7 +196,11 @@ impl TestEnv {
     // ---- PDAs ----
 
     pub fn pool_pda(&self) -> (Pubkey, u8) {
-        Pool::derive_pda(&self.mint_a.pubkey(), &self.mint_b.pubkey(), &self.program_id)
+        Pool::derive_pda(
+            &self.mint_a.pubkey(),
+            &self.mint_b.pubkey(),
+            &self.program_id,
+        )
     }
     pub fn vault_a_pda(&self) -> (Pubkey, u8) {
         Pool::derive_vault_a_pda(&self.pool_pda().0, &self.program_id)
@@ -205,34 +222,20 @@ impl TestEnv {
 
     pub async fn create_funded_user(&mut self, lamports: u64) -> Keypair {
         let user = Keypair::new();
-        let ix =
-            system_instruction::transfer(&self.payer.pubkey(), &user.pubkey(), lamports);
+        let ix = system_instruction::transfer(&self.payer.pubkey(), &user.pubkey(), lamports);
         self.send(&[ix], &[]).await.unwrap();
         user
     }
 
     pub async fn create_ata(&mut self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-        let ata = get_associated_token_address_with_program_id(
-            owner,
-            mint,
-            &self.token_program,
-        );
-        let ix = create_associated_token_account(
-            &self.payer.pubkey(),
-            owner,
-            mint,
-            &self.token_program,
-        );
+        let ata = get_associated_token_address_with_program_id(owner, mint, &self.token_program);
+        let ix =
+            create_associated_token_account(&self.payer.pubkey(), owner, mint, &self.token_program);
         self.send(&[ix], &[]).await.unwrap();
         ata
     }
 
-    pub async fn mint_to(
-        &mut self,
-        mint: &Pubkey,
-        recipient_ata: &Pubkey,
-        amount: u64,
-    ) {
+    pub async fn mint_to(&mut self, mint: &Pubkey, recipient_ata: &Pubkey, amount: u64) {
         let ix = token_ix::mint_to(
             &self.token_program,
             mint,
@@ -247,12 +250,7 @@ impl TestEnv {
 
     /// Convenience: creates an ATA for `user` for the given mint, then mints
     /// `amount` tokens to it. Returns the ATA address.
-    pub async fn fund_token(
-        &mut self,
-        user: &Pubkey,
-        mint: &Pubkey,
-        amount: u64,
-    ) -> Pubkey {
+    pub async fn fund_token(&mut self, user: &Pubkey, mint: &Pubkey, amount: u64) -> Pubkey {
         let ata = self.create_ata(user, mint).await;
         self.mint_to(mint, &ata, amount).await;
         ata
@@ -439,8 +437,9 @@ impl TestEnv {
     ) -> (Keypair, Pubkey, Pubkey, Pubkey) {
         self.initialize_pool_default().await;
         // First-deposit minimum is 1e6 per side; tests should pass amounts above.
-        let (user, ata_a, ata_b, ata_lp) =
-            self.setup_user(10_000_000_000, amount_a * 2, amount_b * 2).await;
+        let (user, ata_a, ata_b, ata_lp) = self
+            .setup_user(10_000_000_000, amount_a * 2, amount_b * 2)
+            .await;
         let ix = self.ix_add_liquidity(
             &user.pubkey(),
             &ata_a,
@@ -456,11 +455,7 @@ impl TestEnv {
 
     // ---- Loan helpers ----
 
-    pub async fn band_state(
-        &mut self,
-        direction: u8,
-        band_id: u32,
-    ) -> Option<LoanIndexBand> {
+    pub async fn band_state(&mut self, direction: u8, band_id: u32) -> Option<LoanIndexBand> {
         let (band_pda, _) = self.band_pda(direction, band_id);
         self.banks_client
             .get_account(band_pda)
@@ -479,10 +474,9 @@ impl TestEnv {
             .and_then(|acc| Loan::try_from_slice(&acc.data).ok())
     }
 
-
-    /// Build + submit an OpenLoan instruction. Returns the assigned nonce
-    /// (= pool.next_loan_nonce at call time) so the test can rederive the
-    /// loan PDA later.
+    /// Build + submit an OpenLoan instruction. Uses `pool.next_loan_nonce` as
+    /// the nonce (the classic client behaviour) and returns it so the test can
+    /// rederive the loan PDA later.
     pub async fn open_loan(
         &mut self,
         borrower: &Keypair,
@@ -492,24 +486,54 @@ impl TestEnv {
         collateral_amount: u64,
         debt_amount: u64,
     ) -> Result<u64, TransportError> {
-        let pool = self.pool_state().await;
-        let nonce = pool.next_loan_nonce;
-        let liq_ratio = pool.liq_ratio_bps;
+        let nonce = self.pool_state().await.next_loan_nonce;
+        self.open_loan_with_nonce(
+            borrower,
+            user_a,
+            user_b,
+            sides,
+            collateral_amount,
+            debt_amount,
+            nonce,
+        )
+        .await
+    }
 
-        let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
-
-        let sides_enum =
-            chiefliquidity::math::LoanSides::from_u8(sides).expect("sides byte");
+    /// `(band_pda, band_id, direction)` the program will file a loan with
+    /// these sides / amounts under (default pool liq ratio).
+    pub fn loan_band(
+        &self,
+        sides: u8,
+        collateral_amount: u64,
+        debt_amount: u64,
+    ) -> (Pubkey, u32, u8) {
+        let sides_enum = chiefliquidity::math::LoanSides::from_u8(sides).expect("sides byte");
         let (trigger_wad, dir) = chiefliquidity::math::recompute_trigger(
             sides_enum,
             collateral_amount as u128,
             debt_amount as u128,
-            liq_ratio,
+            chiefliquidity::instructions::initialize_pool::LIQ_RATIO_BPS,
         )
         .expect("trigger");
-        let band_id =
-            chiefliquidity::math::band_id_for_trigger(trigger_wad).expect("band_id");
-        let (band_pda, _) = self.band_pda(dir as u8, band_id);
+        let band_id = chiefliquidity::math::band_id_for_trigger(trigger_wad).expect("band_id");
+        (self.band_pda(dir as u8, band_id).0, band_id, dir as u8)
+    }
+
+    /// Build + submit an OpenLoan instruction at an explicit, client-chosen
+    /// `nonce` (any value whose Loan PDA is free is accepted).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_loan_with_nonce(
+        &mut self,
+        borrower: &Keypair,
+        user_a: &Pubkey,
+        user_b: &Pubkey,
+        sides: u8,
+        collateral_amount: u64,
+        debt_amount: u64,
+        nonce: u64,
+    ) -> Result<u64, TransportError> {
+        let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
+        let (band_pda, band_id, dir) = self.loan_band(sides, collateral_amount, debt_amount);
 
         let data = LiquidityInstruction::OpenLoan {
             sides,
@@ -537,7 +561,7 @@ impl TestEnv {
             data: borsh::to_vec(&data).unwrap(),
         };
         self.send_with_new_blockhash(&[ix], &[borrower]).await?;
-        self.opened_loans.push((loan_pda, band_id, dir as u8));
+        self.opened_loans.push((loan_pda, band_id, dir));
         Ok(nonce)
     }
 
@@ -679,8 +703,10 @@ impl TestEnv {
             }
             bands.push((band_id, loans));
         }
-        self.swap(user, ata_a, ata_b, amount_in, min_out, a_to_b, boundary, &bands)
-            .await
+        self.swap(
+            user, ata_a, ata_b, amount_in, min_out, a_to_b, boundary, &bands,
+        )
+        .await
     }
 
     // ---- Admin helpers ----
