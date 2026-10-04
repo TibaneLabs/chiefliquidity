@@ -113,7 +113,9 @@ pub enum LiquidityInstruction {
     /// pre-funded with lamports are adopted, not rejected.
     ///
     /// LTV check: debt_value / collateral_value ≤ `pool.max_ltv_bps`, with
-    /// values converted via the pool's accounted mid-price.
+    /// values converted at BOTH the pool's accounted mid-price and its
+    /// manipulation-resistant reference price (`DESIGN.md` §12); the less
+    /// favourable must pass.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
@@ -197,7 +199,7 @@ pub enum LiquidityInstruction {
     /// whose trigger has been crossed, (c) liquidates it, and (d) recomputes.
     /// After the loop terminates, the swap is quoted on the final accounted
     /// reserves and committed only if it satisfies the user's `min_out` and the
-    /// pool's executable cap.
+    /// pool's executable cap (a zero output always reverts).
     ///
     /// `band_loan_counts[i]` = number of loans supplied for the `i`-th band
     /// (must equal that band's `count`). The total tail account count is

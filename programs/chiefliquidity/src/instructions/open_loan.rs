@@ -32,7 +32,10 @@ use crate::{
     account_utils::{create_pda_account, is_zeroed_program_account},
     error::LiquidityError,
     events::{Event, LoanOpened},
-    math::{band_id_for_trigger, ltv_bps, recompute_trigger, LoanSides},
+    math::{
+        band_id_for_trigger, is_liquidatable, ltv_bps, price_b_per_a_wad, recompute_trigger,
+        LoanSides, WAD,
+    },
     state::{
         bitmap_set, validate_token_program_for_mint, Loan, LoanIndexBand, Pool, BAND_SEED,
         LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR, LOAN_SEED, POOL_SEED,
@@ -116,25 +119,34 @@ pub fn process_open_loan(
     }
 
     // ltv = debt_value / collateral_value, both in the same token's units via
-    // the pool mid-price.
+    // a B-per-A price. It is evaluated at BOTH the spot mid-price and the
+    // manipulation-resistant reference price (DESIGN.md §12), and the less
+    // favourable one must pass: a same-transaction pump moves spot but not
+    // the reference, so it can no longer inflate the collateral's value.
     //   CollateralA, DebtB:   ltv = debt * accounted_a / (collateral * accounted_b)
+    //                             = debt * WAD / (collateral * ref_price_wad)
     //   CollateralB, DebtA:   ltv = debt * accounted_b / (collateral * accounted_a)
-    let loan_ltv_bps = match sides {
-        LoanSides::CollateralA => ltv_bps(
-            debt_amount as u128,
-            collateral_amount as u128,
-            accounted_a,
-            accounted_b,
-        )?,
-        LoanSides::CollateralB => ltv_bps(
-            debt_amount as u128,
-            collateral_amount as u128,
-            accounted_b,
-            accounted_a,
-        )?,
+    //                             = debt * ref_price_wad / (collateral * WAD)
+    // (Spot uses the exact reserve ratio; the reference is WAD-scaled.)
+    let spot_price_wad = price_b_per_a_wad(accounted_a, accounted_b)?;
+    let ref_price_wad = pool.ref_price_at(spot_price_wad, clock_for_bump.slot)?;
+    let ((spot_num, spot_den), (ref_num, ref_den)) = match sides {
+        LoanSides::CollateralA => ((accounted_a, accounted_b), (WAD, ref_price_wad)),
+        LoanSides::CollateralB => ((accounted_b, accounted_a), (ref_price_wad, WAD)),
     };
+    let debt = debt_amount as u128;
+    let collateral = collateral_amount as u128;
+    let loan_ltv_bps = ltv_bps(debt, collateral, spot_num, spot_den)?
+        .max(ltv_bps(debt, collateral, ref_num, ref_den)?);
     if loan_ltv_bps > pool.max_ltv_bps as u128 {
         msg!("ltv_bps {} > max_ltv_bps {}", loan_ltv_bps, pool.max_ltv_bps);
+        return Err(LiquidityError::LtvExceedsMax.into());
+    }
+    // max_ltv < 1 / liq_ratio (a compile-time assert in `initialize_pool`)
+    // already keeps a passing loan off its trigger; check it explicitly so
+    // rounding at extreme prices can never open a loan the next swap must
+    // liquidate.
+    if is_liquidatable(trigger_price_wad, direction, spot_price_wad) {
         return Err(LiquidityError::LtvExceedsMax.into());
     }
 

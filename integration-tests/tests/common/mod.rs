@@ -15,12 +15,15 @@ use chiefliquidity::{
     LiquidityInstruction,
 };
 use solana_program::{
+    clock::Clock,
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     pubkey::Pubkey,
     system_instruction,
 };
-use solana_program_test::{processor, BanksClient, ProgramTest, ProgramTestBanksClientExt};
+use solana_program_test::{
+    processor, BanksClient, ProgramTest, ProgramTestBanksClientExt, ProgramTestContext,
+};
 use solana_sdk::{
     account::Account,
     commitment_config::CommitmentLevel,
@@ -88,6 +91,9 @@ pub struct TestEnv {
     /// without needing removal. Lets `swap_full` reconstruct each band's
     /// membership now that bands store only a count, not a member list.
     pub opened_loans: Vec<(Pubkey, u32, u8)>,
+    /// The bank context, kept so tests can `warp_slots` (program-test
+    /// otherwise processes every transaction in the same slot).
+    pub context: ProgramTestContext,
 }
 
 impl TestEnv {
@@ -151,7 +157,10 @@ impl TestEnv {
             program_test.add_account(key, account);
         }
 
-        let (mut banks_client, payer, last_blockhash) = program_test.start().await;
+        let context = program_test.start_with_context().await;
+        let mut banks_client = context.banks_client.clone();
+        let payer = context.payer.insecure_clone();
+        let last_blockhash = context.last_blockhash;
 
         let token_program = spl_token_2022::id();
         let mint_a_decimals = 9;
@@ -190,7 +199,25 @@ impl TestEnv {
             token_program,
             upgrade_authority,
             opened_loans: Vec::new(),
+            context,
         }
+    }
+
+    // ---- Clock ----
+
+    pub async fn current_slot(&mut self) -> u64 {
+        self.banks_client
+            .get_sysvar::<Clock>()
+            .await
+            .expect("clock sysvar")
+            .slot
+    }
+
+    /// Advance the bank `n` slots and fetch a fresh blockhash.
+    pub async fn warp_slots(&mut self, n: u64) {
+        let slot = self.current_slot().await;
+        self.context.warp_to_slot(slot + n).expect("warp");
+        self.refresh_blockhash().await;
     }
 
     // ---- PDAs ----

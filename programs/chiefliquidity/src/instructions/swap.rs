@@ -1,15 +1,20 @@
 //! Swap with mandatory in-flight liquidation. See `DESIGN.md` §7.
 //!
 //! High-level flow:
-//!   1. Load pool, vault balances, accounted/swappable reserves.
+//!   1. Load pool, vault balances, accounted/swappable reserves. On the first
+//!      swap of a slot, fold the pre-swap spot price into the reference-price
+//!      EMA (§12).
 //!   2. Parse the variable account tail into per-band `(band, [loans])` and
 //!      prove each supplied band's membership is complete (§6.5): exactly
 //!      `band.count` distinct open loans, sorted ascending by pubkey, each with
 //!      matching `band_id` and `direction`.
-//!   3. Iteratively: compute post-swap price → find next supplied loan that's
-//!      triggered (direction matches, trigger crosses post_price) → liquidate
-//!      → recompute. Cap at `MAX_LIQ_PER_SWAP`.
-//!   4. Final swap quote against the post-liquidation accounted reserves.
+//!   3. Iteratively: compute post-swap price (the accounted price after
+//!      settlement: input side + amount_in − protocol skim, output side −
+//!      amount_out) → find next supplied loan that's triggered (direction
+//!      matches, trigger crosses post_price) → liquidate → recompute. Cap at
+//!      `MAX_LIQ_PER_SWAP`.
+//!   4. Final swap quote against the post-liquidation accounted reserves
+//!      (the loop's last quote); zero output reverts.
 //!   5. Enforce slippage gate and executable-reserve cap.
 //!   6. Move tokens, persist updated accounts.
 //!
@@ -41,7 +46,7 @@ use crate::{
     },
     state::{
         bitmap_clear, bitmap_iter_set_range, validate_token_program_for_mint, Loan, LoanIndexBand,
-        Pool, POOL_SEED,
+        Pool, BAND_SEED, POOL_SEED,
     },
 };
 
@@ -168,6 +173,22 @@ pub fn process_swap(
         {
             return Err(LiquidityError::BandMismatch.into());
         }
+        // Defense in depth: the account must also sit at the band PDA its
+        // contents claim (stored bump ⇒ one cheap hash, no bump search).
+        let expected_band = Pubkey::create_program_address(
+            &[
+                BAND_SEED,
+                pool_info.key.as_ref(),
+                &[band.direction],
+                &band.band_id.to_le_bytes(),
+                &[band.bump],
+            ],
+            program_id,
+        )
+        .map_err(|_| LiquidityError::BandMismatch)?;
+        if *band_info.key != expected_band {
+            return Err(LiquidityError::BandMismatch.into());
+        }
         // No band may be supplied twice — combined with strict ascension within
         // a band, this makes every supplied loan globally distinct.
         if supplied_band_ids.contains(&band.band_id) {
@@ -264,23 +285,52 @@ pub fn process_swap(
     // happening below remove principal from total_debt (the index isn't
     // touched again — by definition liquidations forfeit accrued interest
     // since the debt is written off, not paid back).
-    pool.bump_indexes(real_a, real_b, Clock::get()?.slot)?;
+    let clock = Clock::get()?;
+    pool.bump_indexes(real_a, real_b, clock.slot)?;
     let (mut accounted_a, mut accounted_b) = pool.accounted(real_a, real_b)?;
     if accounted_a == 0 || accounted_b == 0 {
         return Err(LiquidityError::ZeroReserves.into());
     }
 
-    // amount_in_after_fee for quote math
-    let fee_bps = pool.swap_fee_bps as u128;
-    if fee_bps >= BPS_DENOM {
+    // ---- Reference price sample (DESIGN.md §12) ----
+    // The first swap of each slot folds the pre-swap spot price — i.e. the
+    // previous slot's close, before this swap or its liquidations move it —
+    // into the EMA. Later swaps in the same slot don't sample, so a pump
+    // inside a transaction can never feed the reference `OpenLoan` checks.
+    if pool.ref_price_wad == 0 || clock.slot != pool.ref_price_slot {
+        let spot_wad = price_b_per_a_wad(accounted_a, accounted_b)?;
+        pool.ref_price_wad = pool.ref_price_at(spot_wad, clock.slot)?;
+        pool.ref_price_slot = clock.slot;
+    }
+
+    // ---- Protocol fee skim ----
+    // Total fee charged on the input side:
+    //   fee_taken = amount_in * swap_fee_bps / BPS_DENOM
+    // Protocol's share (rest stays as LP yield via implicit accounted growth):
+    //   protocol_portion = fee_taken * protocol_fee_bps / swap_fee_bps
+    if pool.swap_fee_bps as u128 >= BPS_DENOM {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
-    let amount_in_after_fee_const =
-        (amount_in as u128) * (BPS_DENOM - fee_bps) / BPS_DENOM;
+    let protocol_portion: u64 = if pool.swap_fee_bps == 0 || pool.protocol_fee_bps == 0 {
+        0
+    } else {
+        let fee_taken = (amount_in as u128) * (pool.swap_fee_bps as u128) / BPS_DENOM;
+        let portion = fee_taken * (pool.protocol_fee_bps as u128) / (pool.swap_fee_bps as u128);
+        portion
+            .try_into()
+            .map_err(|_| LiquidityError::MathOverflow)?
+    };
+    // What the accounted input reserve actually grows by once the swap
+    // settles: the whole input minus the protocol's skim (the LP fee stays in
+    // reserves). Trigger and boundary checks price against this, not against
+    // the fee-reduced amount the CPMM quote uses.
+    let in_growth = (amount_in - protocol_portion) as u128;
 
     // ---- Iterative liquidation loop ----
+    // Settles on the final quote and the true post-swap price: the loop only
+    // exits once no supplied, unliquidated loan triggers at that price.
     let mut liq_count = 0u32;
-    loop {
+    let (amount_out, final_post_price_wad) = loop {
         // Quote and compute the would-be post_price.
         let (in_reserve, out_reserve) = if a_to_b {
             (accounted_a, accounted_b)
@@ -296,25 +346,8 @@ pub fn process_swap(
             out_reserve,
             pool.swap_fee_bps,
         )?;
-        let (post_a, post_b) = if a_to_b {
-            (
-                accounted_a + amount_in_after_fee_const,
-                accounted_b
-                    .checked_sub(amount_out)
-                    .ok_or(LiquidityError::MathUnderflow)?,
-            )
-        } else {
-            (
-                accounted_a
-                    .checked_sub(amount_out)
-                    .ok_or(LiquidityError::MathUnderflow)?,
-                accounted_b + amount_in_after_fee_const,
-            )
-        };
-        if post_a == 0 {
-            return Err(LiquidityError::ZeroReserves.into());
-        }
-        let post_price_wad = price_b_per_a_wad(post_a, post_b)?;
+        let post_price_wad =
+            post_swap_price_wad(accounted_a, accounted_b, in_growth, amount_out, a_to_b)?;
 
         // Find next triggered, not-yet-liquidated loan.
         let next_idx = loans.iter().position(|l| {
@@ -322,7 +355,7 @@ pub fn process_swap(
         });
         let i = match next_idx {
             Some(i) => i,
-            None => break,
+            None => break (amount_out, post_price_wad),
         };
 
         if liq_count >= MAX_LIQ_PER_SWAP {
@@ -365,20 +398,14 @@ pub fn process_swap(
         let (new_a, new_b) = pool.accounted(real_a, real_b)?;
         accounted_a = new_a;
         accounted_b = new_b;
-    }
-
-    // ---- Final quote on post-liquidation accounted reserves ----
-    let (in_reserve, out_reserve) = if a_to_b {
-        (accounted_a, accounted_b)
-    } else {
-        (accounted_b, accounted_a)
     };
-    let amount_out = cpmm_quote_out(
-        amount_in as u128,
-        in_reserve,
-        out_reserve,
-        pool.swap_fee_bps,
-    )?;
+
+    // ---- Final quote (post-liquidation accounted reserves, from the loop) ----
+    // Never take input for nothing: dust swaps that round to zero output
+    // revert even with `min_out == 0`.
+    if amount_out == 0 {
+        return Err(LiquidityError::ZeroAmount.into());
+    }
     let amount_out_u64: u64 = amount_out
         .try_into()
         .map_err(|_| LiquidityError::MathOverflow)?;
@@ -394,21 +421,7 @@ pub fn process_swap(
         return Err(LiquidityError::Insolvent.into());
     }
 
-    // ---- Protocol fee skim ----
-    // Total fee charged on the input side:
-    //   fee_taken = amount_in * swap_fee_bps / BPS_DENOM
-    // Protocol's share (rest stays as LP yield via implicit accounted growth):
-    //   protocol_portion = fee_taken * protocol_fee_bps / swap_fee_bps
-    let protocol_portion: u64 = if pool.swap_fee_bps == 0 || pool.protocol_fee_bps == 0 {
-        0
-    } else {
-        let fee_taken = (amount_in as u128) * (pool.swap_fee_bps as u128) / BPS_DENOM;
-        let portion =
-            fee_taken * (pool.protocol_fee_bps as u128) / (pool.swap_fee_bps as u128);
-        portion
-            .try_into()
-            .map_err(|_| LiquidityError::MathOverflow)?
-    };
+    // ---- Accrue the protocol fee skim (computed above) ----
     if protocol_portion > 0 {
         if a_to_b {
             pool.protocol_fees_a = pool
@@ -425,26 +438,9 @@ pub fn process_swap(
 
     // ---- Final boundary check: post-swap price's band must be on the
     // claimed side of `band_boundary`. If the cascade pushed the price past
-    // the caller's claim, more bands could have triggered. Revert. ----
-    let (final_post_a, final_post_b) = if a_to_b {
-        (
-            accounted_a + amount_in_after_fee_const,
-            accounted_b
-                .checked_sub(amount_out)
-                .ok_or(LiquidityError::MathUnderflow)?,
-        )
-    } else {
-        (
-            accounted_a
-                .checked_sub(amount_out)
-                .ok_or(LiquidityError::MathUnderflow)?,
-            accounted_b + amount_in_after_fee_const,
-        )
-    };
-    if final_post_a == 0 {
-        return Err(LiquidityError::ZeroReserves.into());
-    }
-    let final_post_price_wad = price_b_per_a_wad(final_post_a, final_post_b)?;
+    // the caller's claim, more bands could have triggered. Revert. The price
+    // is the loop's final one — the same the trigger checks used — and equals
+    // the accounted price the pool will actually show after settlement. ----
     let final_post_band = band_id_for_trigger(final_post_price_wad)?;
     // For OnFall (a_to_b): final_post_band must be ≥ band_boundary (price
     // didn't fall further than claimed). For OnRise (b_to_a): ≤ band_boundary.
@@ -460,7 +456,6 @@ pub fn process_swap(
     persist_liquidations(accounts, &loans, &bands, &mut pool, expected_dir_byte)?;
 
     // ---- Token transfers ----
-    let clock = Clock::get()?;
     let pool_pda_seeds: &[&[u8]] = &[
         POOL_SEED,
         pool.mint_a.as_ref(),
@@ -571,6 +566,39 @@ pub fn process_swap(
     }
     .emit();
     Ok(())
+}
+
+/// B-per-A price of the accounted reserves once a swap settles: the input
+/// side grows by `in_growth` (amount in minus the protocol skim), the output
+/// side shrinks by `amount_out`.
+fn post_swap_price_wad(
+    accounted_a: u128,
+    accounted_b: u128,
+    in_growth: u128,
+    amount_out: u128,
+    a_to_b: bool,
+) -> Result<u128, LiquidityError> {
+    let (post_a, post_b) = if a_to_b {
+        (
+            accounted_a
+                .checked_add(in_growth)
+                .ok_or(LiquidityError::MathOverflow)?,
+            accounted_b
+                .checked_sub(amount_out)
+                .ok_or(LiquidityError::MathUnderflow)?,
+        )
+    } else {
+        (
+            accounted_a
+                .checked_sub(amount_out)
+                .ok_or(LiquidityError::MathUnderflow)?,
+            accounted_b
+                .checked_add(in_growth)
+                .ok_or(LiquidityError::MathOverflow)?,
+        )
+    };
+    // price_b_per_a_wad rejects post_a == 0 with ZeroReserves.
+    price_b_per_a_wad(post_a, post_b)
 }
 
 /// For each band, tombstone its liquidated loans and decrement the band's

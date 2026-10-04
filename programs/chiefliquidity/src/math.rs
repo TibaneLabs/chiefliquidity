@@ -993,3 +993,117 @@ mod tests {
         );
     }
 }
+
+// ===== Reference price (manipulation-resistant valuation, DESIGN.md §12) =====
+
+/// Smoothing window of the reference-price EMA, in slots (~60 s at 400 ms).
+///
+/// A sample observed after `n` slots moves the reference by `n / H` of its gap
+/// to spot (`n ≥ H` snaps to spot). One slot of a pumped price therefore moves
+/// it by at most `1/H` of the pump, so a leader's 4-slot window moves it by
+/// ≤ ~2.7% of the pump — inflating the reference by the 25% needed to borrow
+/// more than the collateral is worth (`1 / max_ltv`) would take a ~10× price
+/// pump held across slots, which no flash loan can finance. The cost of a
+/// larger `H` is only UX: `OpenLoan` values collateral at the *less*
+/// favourable of spot and reference, so a lagging reference can tighten (never
+/// loosen) a borrower's limit for about a minute after a genuine move.
+pub const REF_PRICE_WINDOW_SLOTS: u64 = 150;
+
+/// Advance the reference price toward the observed `spot_wad` after
+/// `elapsed_slots`: `ref + (spot − ref) · min(elapsed, H) / H`, rounded toward
+/// the previous reference. `prev_ref_wad == 0` means "unset" and seeds the
+/// reference with `spot_wad`. The result always lies between the two inputs,
+/// so it cannot overflow.
+pub fn ema_ref_price_wad(
+    prev_ref_wad: u128,
+    spot_wad: u128,
+    elapsed_slots: u64,
+) -> Result<u128, LiquidityError> {
+    if prev_ref_wad == 0 || elapsed_slots >= REF_PRICE_WINDOW_SLOTS {
+        return Ok(spot_wad);
+    }
+    let w = elapsed_slots as u128;
+    let h = REF_PRICE_WINDOW_SLOTS as u128;
+    if spot_wad >= prev_ref_wad {
+        Ok(prev_ref_wad + mul_div(spot_wad - prev_ref_wad, w, h)?)
+    } else {
+        Ok(prev_ref_wad - mul_div(prev_ref_wad - spot_wad, w, h)?)
+    }
+}
+
+#[cfg(test)]
+mod ref_price_tests {
+    use super::*;
+
+    const H: u64 = REF_PRICE_WINDOW_SLOTS;
+
+    #[test]
+    fn unset_reference_seeds_with_spot() {
+        assert_eq!(ema_ref_price_wad(0, 3 * WAD, 0).unwrap(), 3 * WAD);
+        assert_eq!(ema_ref_price_wad(0, 3 * WAD, 1).unwrap(), 3 * WAD);
+    }
+
+    #[test]
+    fn zero_elapsed_is_identity() {
+        assert_eq!(ema_ref_price_wad(WAD, 4 * WAD, 0).unwrap(), WAD);
+    }
+
+    #[test]
+    fn single_slot_pump_moves_at_most_one_over_h() {
+        let r = WAD;
+        // Pump up 4×: the reference moves by ≤ 3/H.
+        let up = ema_ref_price_wad(r, 4 * r, 1).unwrap();
+        assert!(up > r);
+        assert!(up - r <= 3 * r / H as u128);
+        // Dump down to 1/4: the reference moves by ≤ (3/4)/H (+1 rounding).
+        let down = ema_ref_price_wad(r, r / 4, 1).unwrap();
+        assert!(down < r);
+        assert!(r - down <= (r - r / 4) / H as u128 + 1);
+    }
+
+    #[test]
+    fn elapsed_at_or_beyond_window_snaps_to_spot() {
+        assert_eq!(ema_ref_price_wad(WAD, 7 * WAD, H).unwrap(), 7 * WAD);
+        assert_eq!(ema_ref_price_wad(WAD, WAD / 7, H + 1).unwrap(), WAD / 7);
+        assert_eq!(ema_ref_price_wad(WAD, 2 * WAD, u64::MAX).unwrap(), 2 * WAD);
+    }
+
+    #[test]
+    fn partial_window_is_linear_in_elapsed() {
+        let half = H / 2;
+        let r = ema_ref_price_wad(WAD, 3 * WAD, half).unwrap();
+        assert_eq!(r, WAD + 2 * WAD * half as u128 / H as u128);
+        let r = ema_ref_price_wad(3 * WAD, WAD, half).unwrap();
+        assert_eq!(r, 3 * WAD - 2 * WAD * half as u128 / H as u128);
+    }
+
+    #[test]
+    fn converges_in_both_directions() {
+        for &(start, target) in &[(WAD, 5 * WAD), (5 * WAD, WAD)] {
+            let mut r = start;
+            let mut prev_gap = start.abs_diff(target);
+            for _ in 0..2_000 {
+                r = ema_ref_price_wad(r, target, 1).unwrap();
+                let gap = r.abs_diff(target);
+                assert!(gap <= prev_gap, "monotone approach");
+                prev_gap = gap;
+            }
+            // Geometric decay (1 − 1/H)^2000 leaves < 1e-5 of the gap.
+            assert!(prev_gap < 4 * WAD / 100_000, "gap={prev_gap}");
+        }
+    }
+
+    #[test]
+    fn no_overflow_and_result_between_inputs() {
+        for &(a, b) in &[
+            (1u128, u128::MAX),
+            (u128::MAX, 1),
+            (u128::MAX - 1, u128::MAX),
+        ] {
+            for e in [1, 2, H / 3, H - 1] {
+                let r = ema_ref_price_wad(a, b, e).unwrap();
+                assert!(r >= a.min(b) && r <= a.max(b));
+            }
+        }
+    }
+}

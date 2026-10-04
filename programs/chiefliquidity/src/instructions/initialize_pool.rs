@@ -260,7 +260,10 @@ pub fn process_initialize_pool(
         protocol_fees_b: 0,
         band_bitmap_fall: [0; 16],
         band_bitmap_rise: [0; 16],
-        _reserved: [0; 32],
+        // Unset: the first swap seeds it from the pre-swap spot price.
+        ref_price_wad: 0,
+        ref_price_slot: 0,
+        _reserved: [0; 8],
     };
     let mut data = pool_info.try_borrow_mut_data()?;
     pool.serialize(&mut &mut data[..])?;

@@ -132,7 +132,16 @@ pub struct Pool {
     /// As above, OnRise direction.
     pub band_bitmap_rise: [u8; 16],
 
-    pub _reserved: [u8; 32],
+    /// Manipulation-resistant B-per-A reference price, WAD-scaled: a
+    /// slot-sampled EMA of the pre-swap spot price, advanced by the first
+    /// `Swap` of each slot (see DESIGN.md §12). `OpenLoan` values collateral
+    /// at the less favourable of spot and this. 0 = unset (pools created or
+    /// last swapped before this field existed).
+    pub ref_price_wad: u128,
+    /// Slot of the last `ref_price_wad` sample.
+    pub ref_price_slot: u64,
+
+    pub _reserved: [u8; 8],
 }
 
 impl Pool {
@@ -148,7 +157,8 @@ impl Pool {
         + 8 * 3                               // open_loans, next_loan_nonce, last_update_slot
         + 8 * 2                               // protocol_fees_a, protocol_fees_b
         + 16 * 2                              // band_bitmap_fall, band_bitmap_rise
-        + 32;                                 // _reserved
+        + 16 + 8                              // ref_price_wad, ref_price_slot
+        + 8;                                  // _reserved
 
     pub fn is_initialized(&self) -> bool {
         self.discriminator == POOL_DISCRIMINATOR
@@ -223,6 +233,23 @@ impl Pool {
             .checked_add(self.total_debt_b)
             .ok_or(LiquidityError::MathOverflow)?;
         Ok((a, b))
+    }
+
+    /// The reference price as of `slot`, given the current accounted
+    /// `spot_wad`: the stored value if it was already sampled this slot,
+    /// otherwise the EMA advanced by one sample of `spot_wad` (seeded with
+    /// it when unset). `Swap` persists this before moving the price; a
+    /// read-only caller gets exactly what a dust swap would have stored —
+    /// with no swap yet this slot, spot is still the previous slot's close.
+    pub fn ref_price_at(&self, spot_wad: u128, slot: u64) -> Result<u128, LiquidityError> {
+        if self.ref_price_wad != 0 && slot == self.ref_price_slot {
+            return Ok(self.ref_price_wad);
+        }
+        crate::math::ema_ref_price_wad(
+            self.ref_price_wad,
+            spot_wad,
+            slot.saturating_sub(self.ref_price_slot),
+        )
     }
 
     /// Mutable reference to the bitmap for the given trigger direction.
@@ -550,7 +577,9 @@ mod tests {
             protocol_fees_b: 0,
             band_bitmap_fall: [0; 16],
             band_bitmap_rise: [0; 16],
-            _reserved: [0; 32],
+            ref_price_wad: 0,
+            ref_price_slot: 0,
+            _reserved: [0; 8],
         }
     }
 
@@ -770,6 +799,45 @@ mod tests {
         p.total_debt_b = 500;
         let (acc_a, acc_b) = p.accounted(1000, 5000).unwrap();
         assert_eq!((acc_a, acc_b), (975, 4900 + 500));
+    }
+
+    /// The reference-price fields are carved out of the old 32-byte
+    /// `_reserved` tail: an account written before they existed (tail all
+    /// zero) must decode with `ref_price_wad == 0` (unset), and the fields
+    /// must sit exactly where `_reserved` used to start.
+    #[test]
+    fn ref_price_fields_occupy_old_reserved_tail() {
+        let mut p = fake_pool();
+        let zeroed = borsh::to_vec(&p).unwrap();
+        let decoded = Pool::try_from_slice(&zeroed).unwrap();
+        assert_eq!(decoded.ref_price_wad, 0);
+        assert_eq!(decoded.ref_price_slot, 0);
+
+        p.ref_price_wad = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10;
+        p.ref_price_slot = 0x1112_1314_1516_1718;
+        let v = borsh::to_vec(&p).unwrap();
+        let tail = &v[Pool::LEN - 32..];
+        assert_eq!(&tail[..16], &p.ref_price_wad.to_le_bytes());
+        assert_eq!(&tail[16..24], &p.ref_price_slot.to_le_bytes());
+        assert_eq!(&tail[24..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn ref_price_at_semantics() {
+        let w = crate::math::WAD;
+        let h = crate::math::REF_PRICE_WINDOW_SLOTS;
+        let mut p = fake_pool();
+        // Unset → seeded with spot, whatever the slot.
+        assert_eq!(p.ref_price_at(3 * w, 0).unwrap(), 3 * w);
+        assert_eq!(p.ref_price_at(3 * w, 500).unwrap(), 3 * w);
+        // Sampled this slot → stored value, spot ignored.
+        p.ref_price_wad = w;
+        p.ref_price_slot = 100;
+        assert_eq!(p.ref_price_at(4 * w, 100).unwrap(), w);
+        // One slot later → moves by 1/H of the gap.
+        assert_eq!(p.ref_price_at(4 * w, 101).unwrap(), w + 3 * w / h as u128);
+        // A full window later → snaps.
+        assert_eq!(p.ref_price_at(4 * w, 100 + h).unwrap(), 4 * w);
     }
 
     /// Confirm the LEN constants. Sizes drift as fields are added; tests
