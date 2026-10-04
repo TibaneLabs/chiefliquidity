@@ -280,16 +280,12 @@ impl Pool {
             self.interest_kink_bps,
         )?;
 
-        self.borrow_index_a_wad = crate::math::bump_index_wad(
-            self.borrow_index_a_wad,
-            rate_a,
-            slots_elapsed,
-        )?;
-        self.borrow_index_b_wad = crate::math::bump_index_wad(
-            self.borrow_index_b_wad,
-            rate_b,
-            slots_elapsed,
-        )?;
+        // Infallible: saturates at `math::INDEX_CAP_WAD`, so index growth can
+        // never make this (and every instruction that calls it) fail.
+        self.borrow_index_a_wad =
+            crate::math::bump_index_wad(self.borrow_index_a_wad, rate_a, slots_elapsed);
+        self.borrow_index_b_wad =
+            crate::math::bump_index_wad(self.borrow_index_b_wad, rate_b, slots_elapsed);
         self.last_index_update_slot = current_slot;
         Ok(())
     }

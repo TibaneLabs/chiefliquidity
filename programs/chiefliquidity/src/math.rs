@@ -160,6 +160,34 @@ fn bps_to_wad(bps: u16) -> u128 {
     (bps as u128) * (WAD / BPS_DENOM)
 }
 
+/// Hard ceiling for a per-side borrow index: `2^64 · WAD` (≈ 1.84e37, about
+/// 1/18 of `u128::MAX`). Interest simply stops accruing once an index reaches
+/// it; `bump_index_wad` saturates here instead of erroring, so the index can
+/// never brick `Pool::bump_indexes` (and with it every instruction, including
+/// `remove_liquidity`).
+///
+/// Why this value. Indexes start at `WAD` and are monotone, so a loan's
+/// snapshot is always `≥ WAD` and the current index is `≤ INDEX_CAP_WAD`.
+/// Hence for any `u64` principal:
+///
+/// ```text
+///   owed = ceil(principal · current / snapshot)
+///        ≤ principal · INDEX_CAP_WAD / WAD
+///        ≤ (2^64 − 1) · 2^64  <  u128::MAX
+/// ```
+///
+/// so `owed_from_index` always fits a `u128` (it may still exceed `u64`, which
+/// the token-transfer layer rejects cleanly). Inside `bump_index_wad` the
+/// U256 product `index · rate · slots` is at most
+/// `2^124 · 2^65 · 2^64 = 2^253` even for the theoretical maximum rate
+/// (`3 · u16::MAX` bps ≈ 19.7 WAD/yr) and `u64::MAX` elapsed slots, so it
+/// cannot overflow either; the saturating code paths are belt-and-braces.
+///
+/// At the strongest configured curve (~3.04 WAD/yr at 100% utilization,
+/// compounding on every bump) the cap is reached after ~14.5 years — roughly
+/// a year before the uncapped index would have overflowed `u128`.
+pub const INDEX_CAP_WAD: u128 = WAD << 64;
+
 /// Linear per-slot bump: `index *= 1 + rate_per_slot * slots_elapsed`.
 /// rate_per_slot = rate_per_year / SLOTS_PER_YEAR.
 ///
@@ -167,29 +195,31 @@ fn bps_to_wad(bps: u16) -> u128 {
 /// integrates over `slots_elapsed` at constant rate); within a bump the
 /// approximation is linear, which under-estimates true e^(rt) by a small
 /// amount for long inactive windows. Acceptable for v1.
+///
+/// Infallible: the result saturates at [`INDEX_CAP_WAD`]. An index already at
+/// or above the cap is returned unchanged (indexes never decrease).
 pub fn bump_index_wad(
     current_index_wad: u128,
     rate_wad_per_year: u128,
     slots_elapsed: u64,
-) -> Result<u128, LiquidityError> {
-    if rate_wad_per_year == 0 || slots_elapsed == 0 {
-        return Ok(current_index_wad);
+) -> u128 {
+    if rate_wad_per_year == 0 || slots_elapsed == 0 || current_index_wad >= INDEX_CAP_WAD {
+        return current_index_wad;
     }
     // delta = index * rate_per_year * slots / (SLOTS_PER_YEAR * WAD)
     let num = U256::from_u128(current_index_wad)
         .checked_mul(U256::from_u128(rate_wad_per_year))
-        .ok_or(LiquidityError::MathOverflow)?
-        .checked_mul(U256::from_u128(slots_elapsed as u128))
-        .ok_or(LiquidityError::MathOverflow)?;
-    let denom = U256::from_u128(SLOTS_PER_YEAR as u128)
-        .checked_mul(WAD_U256)
-        .ok_or(LiquidityError::MathOverflow)?;
-    let delta = (num / denom)
-        .to_u128()
-        .ok_or(LiquidityError::MathOverflow)?;
-    current_index_wad
-        .checked_add(delta)
-        .ok_or(LiquidityError::MathOverflow)
+        .and_then(|n| n.checked_mul(U256::from_u128(slots_elapsed as u128)));
+    let Some(num) = num else {
+        return INDEX_CAP_WAD;
+    };
+    // SLOTS_PER_YEAR * WAD ≈ 7.9e25 — fits a u128 trivially.
+    let denom = U256::from_u128(SLOTS_PER_YEAR as u128 * WAD);
+    let new_index = U256::from_u128(current_index_wad).saturating_add(num / denom);
+    match new_index.to_u128() {
+        Some(v) => v.min(INDEX_CAP_WAD),
+        None => INDEX_CAP_WAD,
+    }
 }
 
 /// Loan-to-value ratio in basis points, using the pool mid-price to convert
@@ -724,14 +754,82 @@ mod tests {
         // Index starts at WAD, rate = 10% APR, slots = 1 year.
         // After: index = 1.1 WAD
         let rate = WAD / 10; // 0.1 WAD/year = 10% APR
-        let r = bump_index_wad(WAD, rate, SLOTS_PER_YEAR).unwrap();
+        let r = bump_index_wad(WAD, rate, SLOTS_PER_YEAR);
         assert_eq!(r, 11 * WAD / 10);
     }
 
     #[test]
     fn test_bump_index_zero_inputs() {
-        assert_eq!(bump_index_wad(WAD, 0, 1000).unwrap(), WAD);
-        assert_eq!(bump_index_wad(WAD, WAD / 10, 0).unwrap(), WAD);
+        assert_eq!(bump_index_wad(WAD, 0, 1000), WAD);
+        assert_eq!(bump_index_wad(WAD, WAD / 10, 0), WAD);
+    }
+
+    /// Theoretical maximum rate: every curve parameter at `u16::MAX` bps,
+    /// 100% utilization → base + slope1 + slope2 ≈ 19.66 WAD/yr.
+    fn max_possible_rate() -> u128 {
+        compute_borrow_rate_wad_per_year(WAD, u16::MAX, u16::MAX, u16::MAX, 1).unwrap()
+    }
+
+    #[test]
+    fn test_bump_index_saturates_at_cap() {
+        // One slot short of the cap with a tiny rate: lands exactly on the cap.
+        let rate = WAD / 10;
+        let near = INDEX_CAP_WAD - 1;
+        assert_eq!(bump_index_wad(near, rate, SLOTS_PER_YEAR), INDEX_CAP_WAD);
+        // At the cap: no further growth, whatever the rate / elapsed time.
+        assert_eq!(bump_index_wad(INDEX_CAP_WAD, rate, 1), INDEX_CAP_WAD);
+        assert_eq!(
+            bump_index_wad(INDEX_CAP_WAD, max_possible_rate(), u64::MAX),
+            INDEX_CAP_WAD
+        );
+        // Below the cap and far from it, growth is unaffected by the cap.
+        let quarter = INDEX_CAP_WAD / 4;
+        assert_eq!(
+            bump_index_wad(quarter, rate, SLOTS_PER_YEAR),
+            quarter + quarter / 10
+        );
+        // A (never-expected) index above the cap is left untouched, not
+        // pulled down — indexes are monotone.
+        assert_eq!(bump_index_wad(u128::MAX, rate, 1), u128::MAX);
+    }
+
+    #[test]
+    fn test_bump_index_extreme_elapsed_does_not_error() {
+        let max_rate = max_possible_rate();
+        let configured_max = compute_borrow_rate_wad_per_year(WAD, 0, 400, 30_000, 8000).unwrap();
+        for &rate in &[configured_max, max_rate] {
+            // From a near-cap index any growth saturates at the cap.
+            for &start in &[INDEX_CAP_WAD / 2, INDEX_CAP_WAD - 1] {
+                assert_eq!(bump_index_wad(start, rate, u64::MAX), INDEX_CAP_WAD);
+            }
+            // From WAD a single linear bump (no compounding) stays well below
+            // the cap even over u64::MAX slots; it must still not error.
+            let r = bump_index_wad(WAD, rate, u64::MAX);
+            assert!(r > WAD && r <= INDEX_CAP_WAD);
+        }
+    }
+
+    #[test]
+    fn test_bump_index_repeated_bumps_reach_cap_without_error() {
+        // Max configured rate, bumped once per day, for 20 years: the
+        // uncapped index would overflow u128 after ~15.5 years.
+        let rate = compute_borrow_rate_wad_per_year(WAD, 0, 400, 30_000, 8000).unwrap();
+        let per_day = SLOTS_PER_YEAR / 365;
+        let mut idx = WAD;
+        let mut prev = idx;
+        for _ in 0..(365 * 20) {
+            idx = bump_index_wad(idx, rate, per_day);
+            assert!(idx >= prev && idx <= INDEX_CAP_WAD);
+            prev = idx;
+        }
+        assert_eq!(idx, INDEX_CAP_WAD);
+    }
+
+    #[test]
+    fn test_owed_at_cap_fits_u128() {
+        // Worst case: max u64 principal, snapshot at WAD, index at the cap.
+        let p = u64::MAX as u128;
+        assert_eq!(owed_from_index(p, WAD, INDEX_CAP_WAD).unwrap(), p << 64);
     }
 
     #[test]
