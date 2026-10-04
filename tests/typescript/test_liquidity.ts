@@ -47,19 +47,6 @@ import {
   ExtensionType,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
-import * as fs from 'fs';
-import * as os from 'os';
-
-/**
- * Load the program's upgrade-authority keypair (the ClaimProtocolFees claimant).
- * On the local validator the program is deployed with `~/.config/solana/id.json`
- * as upgrade authority (see scripts/run-e2e-tests.sh).
- */
-function loadUpgradeAuthority(): Keypair {
-  const path = `${os.homedir()}/.config/solana/id.json`;
-  const secret = Uint8Array.from(JSON.parse(fs.readFileSync(path, 'utf8')));
-  return Keypair.fromSecretKey(secret);
-}
 
 // ===== Program constants (must match programs/chiefliquidity/src) =====
 
@@ -111,11 +98,9 @@ enum Ix {
   Swap = 7,
 }
 
-// BPF upgradeable loader — owns the ProgramData account that records the
-// program's upgrade authority (the ClaimProtocolFees claimant).
-const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
-const [PROGRAM_DATA_ADDRESS] = PublicKey.findProgramAddressSync(
-  [PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE);
+// Fixed recipient of protocol fees (claim_protocol_fees.rs). ClaimProtocolFees
+// is a permissionless crank; fees always land in accounts this key owns.
+const PROTOCOL_FEE_RECIPIENT = new PublicKey('23KPtJApAdwgo1ogjSLLUrx6ghy79ArNzJLeqMNhhiDj');
 
 // LiquidityError discriminants (error.rs order — append-only ABI)
 enum Err {
@@ -457,7 +442,8 @@ class Ctx {
   }
 
   ata(owner: PublicKey, mint: PublicKey): PublicKey {
-    return getAssociatedTokenAddressSync(mint, owner, false, this.programFor(mint));
+    // allowOwnerOffCurve: PROTOCOL_FEE_RECIPIENT is an off-curve (PDA) owner.
+    return getAssociatedTokenAddressSync(mint, owner, true, this.programFor(mint));
   }
 
   async send(ixs: TransactionInstruction[], signers: Keypair[],
@@ -758,31 +744,30 @@ class Ctx {
   }
 
   /**
-   * Claim protocol fees. Gated on the PROGRAM upgrade authority (pools have
-   * none): `authority` must be the program's upgrade authority and the
-   * ProgramData account is supplied so the program can read it. Fees land in
-   * `authority`'s ATAs (created by the caller).
+   * Claim protocol fees. Permissionless crank (no signer beyond the fee
+   * payer): the program sends the fees to the token accounts `destA`/`destB`,
+   * which must be owned by PROTOCOL_FEE_RECIPIENT (defaults to its ATAs).
    */
-  async claimProtocolFees(authority: Keypair): Promise<void> {
-    const owner = authority.publicKey;
+  async claimProtocolFees(
+    destA: PublicKey = this.ata(PROTOCOL_FEE_RECIPIENT, this.mintA),
+    destB: PublicKey = this.ata(PROTOCOL_FEE_RECIPIENT, this.mintB),
+  ): Promise<void> {
     const ix = new TransactionInstruction({
       programId: PROGRAM_ID,
       keys: [
         { pubkey: this.pool, isSigner: false, isWritable: true },
         { pubkey: this.vaultA, isSigner: false, isWritable: true },
         { pubkey: this.vaultB, isSigner: false, isWritable: true },
-        { pubkey: this.ata(owner, this.mintA), isSigner: false, isWritable: true },
-        { pubkey: this.ata(owner, this.mintB), isSigner: false, isWritable: true },
+        { pubkey: destA, isSigner: false, isWritable: true },
+        { pubkey: destB, isSigner: false, isWritable: true },
         { pubkey: this.mintA, isSigner: false, isWritable: false },
         { pubkey: this.mintB, isSigner: false, isWritable: false },
-        { pubkey: authority.publicKey, isSigner: true, isWritable: false },
-        { pubkey: PROGRAM_DATA_ADDRESS, isSigner: false, isWritable: false },
         { pubkey: this.tokenProgramA, isSigner: false, isWritable: false },
         { pubkey: this.tokenProgramB, isSigner: false, isWritable: false },
       ],
       data: Buffer.from([Ix.ClaimProtocolFees]),
     });
-    await this.send([ix], [authority]);
+    await this.send([ix], []);
   }
 
   async claimLiquidatedRent(borrower: Keypair, loan: PublicKey): Promise<void> {
@@ -1123,7 +1108,7 @@ async function runTests() {
       await expectError(ctx.send([ix], [trader]), Err.InvalidPool, 'foreign vault');
     });
 
-    await T('Protocol fees: only the program upgrade authority can claim', async (ctx) => {
+    await T('Protocol fees: permissionless crank, paid only to the fixed recipient', async (ctx) => {
       await ctx.setupPoolWithLiquidity(1_000_000_000n, 4_000_000_000n);
       const trader = await ctx.newUser(10, 100_000_000n, 0n);
       await ctx.swap(trader, 100_000_000n, 1n, true);
@@ -1132,8 +1117,8 @@ async function runTests() {
       assertEq(pool.protocolFeesA, 50_000n, 'protocol fee A accrued');
 
       const makeAtas = async (owner: PublicKey) => {
-        // Idempotent: `stranger` already has ATAs from newUser; the upgrade
-        // authority does not — this handles both.
+        // Idempotent: `stranger` already has ATAs from newUser; the fixed
+        // recipient does not — this handles both.
         const ixs: TransactionInstruction[] = [];
         for (const mint of [ctx.mintA, ctx.mintB]) {
           ixs.push(createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
@@ -1142,22 +1127,23 @@ async function runTests() {
         await ctx.send(ixs, []);
       };
 
-      // A non-upgrade-authority signer (a stranger — pools grant no authority) is rejected.
+      // Redirecting fees to a non-recipient account is rejected.
       const stranger = await ctx.newUser(10, 0n, 0n);
       await makeAtas(stranger.publicKey);
-      await expectError(ctx.claimProtocolFees(stranger),
-        Err.InvalidAuthority, 'non-upgrade-authority claim');
+      await expectError(
+        ctx.claimProtocolFees(
+          ctx.ata(stranger.publicKey, ctx.mintA), ctx.ata(stranger.publicKey, ctx.mintB)),
+        Err.InvalidFeeRecipient, 'fees redirected to a stranger');
 
-      // The program's upgrade authority claims successfully.
-      const authority = loadUpgradeAuthority();
-      await makeAtas(authority.publicKey);
-      await ctx.claimProtocolFees(authority);
-      assertEq(await ctx.tokenBalance(authority.publicKey, ctx.mintA), 50_000n,
-        'fees received by upgrade authority');
+      // Anyone (here: the test payer, no authority) may crank the claim.
+      await makeAtas(PROTOCOL_FEE_RECIPIENT);
+      await ctx.claimProtocolFees();
+      assertEq(await ctx.tokenBalance(PROTOCOL_FEE_RECIPIENT, ctx.mintA), 50_000n,
+        'fees received by the fixed recipient');
       pool = await ctx.poolState();
       assertEq(pool.protocolFeesA, 0n, 'fee counter reset');
       // Second claim: no-op success.
-      await ctx.claimProtocolFees(authority);
+      await ctx.claimProtocolFees();
     });
 
     // ---------- Loans ----------
